@@ -1,0 +1,14 @@
+[package]
+name = "qd-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Rust compute body for QuantDinger — pure-math port of hot-path Python helpers. The Python backend remains the untouched main brain."
+license = "Apache-2.0"
+
+[dependencies]
+# Intentionally dependency-free: only std is used, so the crate builds
+# offline and stays a small, auditable math body.
+
+[lib]
+name = "qd_engine"
+path = "src/lib.rs"

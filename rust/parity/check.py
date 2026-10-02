@@ -88,6 +88,7 @@ _load("app.services.strategy_v2.models", "app/services/strategy_v2/models.py")
 _load("app.services.market_schedule", "app/services/market_schedule.py")
 _load("app.services.backtest_metrics", "app/services/backtest/metrics.py")
 _load("app.services.strategy_v2.instruments", "app/services/strategy_v2/instruments.py")
+_load("app.services.strategy_v2.data_portal", "app/services/strategy_v2/data.py")
 _load("app.services.strategy_v2.curve_sampling", "app/services/strategy_v2/curve_sampling.py")
 _prot = _load("app.services.strategy_v2.protection", "app/services/strategy_v2/protection.py")
 
@@ -654,6 +655,83 @@ def main() -> int:
         check(f"mvis[{i}].vis", vis, py_vis)
         check(f"mvis[{i}].hidden", hidden, py_hidden_sorted)
         check(f"mvis[{i}].kept", kept, py_kept)
+
+    # --- data_portal: same 5-bar frame through the real portal ---
+    from app.services.strategy_v2.data_portal import (  # noqa: E402
+        MultiAssetDataPortal as PyPortal,
+    )
+    _PD = 86_400
+    _PB = 1_767_225_600
+    _idx = pd.date_range(pd.Timestamp(_PB, unit="s"), periods=5, freq="D")
+    _py_frame = pd.DataFrame(
+        {"open": [100.0 + i for i in range(5)],
+         "high": [101.0 + i for i in range(5)],
+         "low": [99.0 + i for i in range(5)],
+         "close": [100.5 + i for i in range(5)],
+         "volume": [1000.0] * 5,
+         "suspended": [0.0] * 5},
+        index=_idx,
+    )
+    _portal = PyPortal({"Crypto:BTC/USDT@spot": _py_frame})
+    _dp = vec["dportal"]
+    assert len(_dp) == 13, len(_dp)
+    for i, (now, incl) in enumerate([(_PB + 2 * _PD + 6 * 3_600, False),
+                                     (_PB + 2 * _PD + 6 * 3_600, True),
+                                     (_PB - _PD, False)]):
+        _portal.set_clock(pd.Timestamp(now, unit="s"), include_current=incl)
+        _end = len(_portal.visible_frame("BTCUSDT"))
+        _cur = _portal.current("BTCUSDT", default=-1.0)
+        _cur_miss = _portal.current("BTCUSDT", field="nope", default=-1.0)
+        _row = _dp[i]
+        check(f"dportal[{i}].cutoff", _row[0],
+              _PB + 2 * _PD + 6 * 3_600 - _PD + (_PD if incl else 0)
+              if i < 2 else _PB - 2 * _PD)
+        check(f"dportal[{i}].end", _row[1], _end)
+        check(f"dportal[{i}].cur", _row[2], _cur, tol=1e-12)
+        check(f"dportal[{i}].cur_nan", _row[3], _cur_miss, tol=1e-12)
+        _pp = _cur if _cur > 0 else None
+        check(f"dportal[{i}].pprice", _row[4], _pp)
+    _portal.set_clock(_idx[2], include_current=True)
+    _bar = _portal.bar_at("BTCUSDT", _idx[1])
+    check("dportal.bar.hit", _dp[3],
+          [(_PB + _PD), _bar["open"], _bar["high"], _bar["low"], _bar["close"],
+           _bar["volume"]])
+    check("dportal.bar.miss", _dp[4], [(_PB + 10 * _PD), None])
+    check("dportal.resolve.direct", _dp[5],
+          ["Crypto:BTC/USDT@spot", _portal.resolve_key("Crypto:BTC/USDT@spot")])
+    check("dportal.resolve.alias", _dp[6], ["BTCUSDT", _portal.resolve_key("BTCUSDT")])
+    check("dportal.resolve.parsed", _dp[7],
+          ["Crypto:BTC/USDT", _portal.resolve_key("Crypto:BTC/USDT")])
+    try:
+        _portal.resolve_key("NOPE")
+        _nope: object = "NO-ERR"
+    except Exception as e:  # noqa: BLE001
+        _nope = f"ERR:{e}"
+    check("dportal.resolve.miss", _dp[8], ["NOPE", _nope])
+    try:
+        PyPortal({"USStock:K": pd.DataFrame()})
+        _e1: object = "NO-ERR"
+    except Exception as e:  # noqa: BLE001
+        _e1 = str(e)
+    check("dportal.err.empty", _dp[9], _e1)
+    try:
+        PyPortal({"USStock:K": pd.DataFrame({"open": [1.0], "close": [1.5]}, index=[_idx[0]])})
+        _e2: object = "NO-ERR"
+    except Exception as e:  # noqa: BLE001
+        _e2 = str(e)
+    check("dportal.err.nohl", _dp[10], _e2)
+    try:
+        _dup = pd.DataFrame(
+            {"open": [1.0, 1.0], "high": [2.0, 2.0], "low": [0.5, 0.5],
+             "close": [1.5, 9.5]},
+            index=[_idx[0], _idx[0]],
+        )
+        PyPortal({"USStock:K": _dup})
+        _e3: object = "NO-ERR"
+    except Exception as e:  # noqa: BLE001
+        _e3 = str(e)
+    check("dportal.err.confl", _dp[11], _e3)
+    check("dportal.symbol", _dp[12], "BTC/USDT")
 
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")

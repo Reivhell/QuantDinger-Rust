@@ -790,7 +790,96 @@ fn main() {
             vars.iter().map(|(k, v)| format!("[{},{}]", jstr(k), jstr(v))).collect::<Vec<_>>().join(",")
         ));
     }
-    out += &format!("\"mvis\":[{}]\n", mv.join(","));
+    out += &format!("\"mvis\":[{}],\n", mv.join(","));
+
+    // data_portal vectors: one 5-bar daily frame, clocks, probes.
+    use qd_engine::data_portal as dp;
+    const PD: i64 = 86_400;
+    const PB: i64 = 1_767_225_600; // Thu 2026-01-01 00:00 UTC
+    let prow: Vec<(i64, f64, f64)> =
+        (0..5).map(|i| (PB + i * PD, 100.0 + i as f64, 100.5 + i as f64)).collect();
+    let praw = dp::RawFrame {
+        columns: ["open", "high", "low", "close", "volume"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        rows: prow
+            .iter()
+            .map(|(t, o, c)| dp::RawBar {
+                ts: Some(*t),
+                open: *o,
+                high: *o + 1.0,
+                low: *o - 1.0,
+                close: *c,
+                volume: (true, Some(1000.0)),
+                extras: vec![("suspended".to_string(), 0.0)],
+            })
+            .collect(),
+    };
+    let pkey = "Crypto:BTC/USDT@spot";
+    let pframe = dp::normalize_frame(pkey, &praw).unwrap();
+    let psym = qd_engine::instruments::parse_instrument(pkey, "").unwrap().symbol;
+    // clocks: (now, include_current, driving, freq)
+    let mut dvec: Vec<String> = Vec::new();
+    for (now, incl) in [(PB + 2 * PD + 6 * 3_600, false), (PB + 2 * PD + 6 * 3_600, true), (PB - PD, false)] {
+        let cutoff = dp::visible_cutoff(Some(now), incl, PD, PD);
+        let end = dp::visible_end(&pframe.ts, cutoff);
+        let cur = dp::current_value(&pframe.close, end, -1.0);
+        // unknown field → default (mirrors `field not in columns`); the
+        // NaN → default line is covered by the `current_nan_and_empty_default`
+        // unit test.
+        let cur_miss = dp::current_value(&[], end, -1.0);
+        dvec.push(format!(
+            "[{},{},{},{},{}]",
+            jopt_num(cutoff.map(|c| c as f64)),
+            end,
+            jopt_num(Some(cur)),
+            jopt_num(Some(cur_miss)),
+            jopt_num(dp::positive_price(cur)),
+        ));
+    }
+    // bar_at exact + missing (flat [ts,o,h,l,c,v])
+    for ts in [PB + PD, PB + 10 * PD] {
+        match dp::bar_at(&pframe, ts) {
+            Some(b) => dvec.push(format!(
+                "[{},{},{},{},{},{}]",
+                ts, b.open, b.high, b.low, b.close, b.volume
+            )),
+            None => dvec.push(format!("[{},null]", ts)),
+        }
+    }
+    // resolve_key probes
+    let mut frames_map = std::collections::HashMap::new();
+    frames_map.insert(pkey.to_string(), pframe);
+    let mut aliases = std::collections::HashMap::new();
+    aliases.insert(psym.clone(), pkey.to_string());
+    for s in [pkey, "BTCUSDT", "Crypto:BTC/USDT", "NOPE"] {
+        match dp::resolve_key(&frames_map, &aliases, s) {
+            Ok(k) => dvec.push(format!("[{},{}]", jstr(s), jstr(&k))),
+            Err(e) => dvec.push(format!("[{},\"ERR:{}\"]", jstr(s), e)),
+        }
+    }
+    // error paths
+    let empty = dp::RawFrame { columns: vec!["open".into()], rows: vec![] };
+    dvec.push(format!("\"{}\"", dp::normalize_frame("USStock:K", &empty).unwrap_err()));
+    let nohl = dp::RawFrame {
+        columns: vec!["open".into(), "close".into()],
+        rows: vec![dp::RawBar {
+            ts: Some(PB), open: 1.0, high: 2.0, low: 0.5, close: 1.5,
+            volume: (false, None), extras: vec![],
+        }],
+    };
+    dvec.push(format!("\"{}\"", dp::normalize_frame("USStock:K", &nohl).unwrap_err()));
+    let confl = dp::RawFrame {
+        columns: ["open", "high", "low", "close"].iter().map(|s| s.to_string()).collect(),
+        rows: vec![
+            dp::RawBar { ts: Some(PB), open: 1.0, high: 2.0, low: 0.5, close: 1.5, volume: (false, None), extras: vec![] },
+            dp::RawBar { ts: Some(PB), open: 1.0, high: 2.0, low: 0.5, close: 9.5, volume: (false, None), extras: vec![] },
+        ],
+    };
+    dvec.push(format!("\"{}\"", dp::normalize_frame("USStock:K", &confl).unwrap_err()));
+    dvec.push(format!("\"{}\"", jstr(&psym).replace('"', "")));
+    out += &format!("\"dportal\":[{}]\n", dvec.join(","));
     out += "}\n";
     print!("{out}");
 }

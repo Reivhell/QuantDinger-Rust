@@ -26,9 +26,13 @@
 //!   (information ratio, band classification, level cleaning)
 //! - `market_visibility` — `app/utils/market_visibility.py`
 //!   (operator-controlled market visibility: ENABLED_MARKETS + SHOW_* flags)
+//! - `data_portal` — pandas-free logic of
+//!   `app/services/strategy_v2/data.py` (point-in-time windowing, key
+//!   resolution, frame normalization)
 
 pub mod close_reason;
 pub mod curve_sampling;
+pub mod data_portal;
 pub mod frequencies;
 pub mod instruments;
 

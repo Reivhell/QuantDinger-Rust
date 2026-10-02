@@ -7,7 +7,7 @@
 
 use qd_research::backtest::{run_backtest, ExecConfig};
 use qd_research::costs::{cost_stress, execution_sensitivity};
-use qd_research::cpcv::cpcv_splits;
+use qd_research::cpcv::{cpcv_splits, score_cpcv_paths};
 use qd_research::features::Bar;
 use qd_research::mae_mfe::analyze_mae_mfe;
 use qd_research::metrics::compute_metrics;
@@ -100,7 +100,24 @@ fn main() {
     let wf = summarize_walkforward(outcomes, 0.5);
 
     let mc = run_monte_carlo(&rets, 2000, 42);
-    let paths = cpcv_splits(n.min(600), 6, 2, 5, 2);
+    // CPCV: 15 paths over the full series; each contiguous test run is
+    // scored flat-to-flat with the strategy under test. Slicing precomputed
+    // signals/regimes is leak-free: every feature is causal per bar, and
+    // each run starts with no position.
+    let splits = cpcv_splits(n, 6, 2, 5, 2);
+    let cpcv_scores = score_cpcv_paths(&splits, 50, |lo, hi| {
+        let r = run_backtest(
+            &bars[lo..hi],
+            &signals[lo..hi],
+            &regimes[lo..hi],
+            &feature_ids[lo..hi],
+            &exec,
+            100_000.0,
+            |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, 0.01, 0.03, 20_000.0),
+        );
+        compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0).total_return
+    });
+    let cpcv_summary = qd_research::montecarlo::summarize(cpcv_scores);
 
     // PBO over a small honest grid: fast ∈ {10,20,30} × slow ∈ {50,100}.
     let mut cfgs = Vec::new();
@@ -179,8 +196,11 @@ fn main() {
         regime_perf: regime_slices(&res.trades, 100_000.0),
         walkforward: Some(wf),
         montecarlo: Some(mc),
-        cpcv_paths: paths.len(),
-        cpcv_median_oos: 0.0,
+        cpcv_paths: splits.len(),
+        cpcv_runs_scored: cpcv_summary.count,
+        cpcv_median_oos: cpcv_summary.median,
+        cpcv_p25_oos: cpcv_summary.p25,
+        cpcv_p75_oos: cpcv_summary.p75,
         pbo: Some(pbo),
         sensitivity: vec![sens],
         cost_stress: cs,

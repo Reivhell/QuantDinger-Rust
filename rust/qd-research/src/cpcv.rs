@@ -104,6 +104,58 @@ fn combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
     }
 }
 
+/// Group a split's test indices into contiguous runs. Scoring callers
+/// typically need contiguous bars (positions cannot carry across a gap);
+/// each run must be evaluated flat-to-flat — documented wherever used.
+pub fn contiguous_runs(test: &[usize], min_len: usize) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut prev = 0usize;
+    for &i in test {
+        match start {
+            None => {
+                start = Some(i);
+                prev = i;
+            }
+            Some(_) if i == prev + 1 => prev = i,
+            Some(s) => {
+                if prev + 1 - s >= min_len {
+                    runs.push((s, prev + 1));
+                }
+                start = Some(i);
+                prev = i;
+            }
+        }
+    }
+    if let Some(s) = start {
+        if prev + 1 - s >= min_len {
+            runs.push((s, prev + 1));
+        }
+    }
+    runs
+}
+
+/// Score every CPCV path's test runs with `score(lo, hi) -> f64` (e.g. OOS
+/// total return of a flat-to-flat backtest on `bars[lo..hi]`). Returns one
+/// value per run. Aggregate with [`crate::montecarlo::summarize`] — the
+/// median is the CPCV OOS estimate, the spread is path instability.
+pub fn score_cpcv_paths(
+    splits: &[CpcvSplit],
+    min_run_len: usize,
+    score: impl Fn(usize, usize) -> f64,
+) -> Vec<f64> {
+    let mut out = Vec::new();
+    for split in splits {
+        if split.train.is_empty() {
+            continue; // starved path (see test): skip, don't fake.
+        }
+        for (lo, hi) in contiguous_runs(&split.test, min_run_len) {
+            out.push(score(lo, hi));
+        }
+    }
+    out
+}
+
 /// Verify a split has no leakage: no train row's label window touches any
 /// test row, and the embargo gap holds. Returns the first offending train
 /// index, if any.
@@ -158,6 +210,22 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].test, vec![0, 1, 2, 3, 4]);
         assert_eq!(s[0].train, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn runs_split_gaps_and_drop_shorts() {
+        assert_eq!(contiguous_runs(&[0, 1, 2, 5, 6, 10], 2), vec![(0, 3), (5, 7)]);
+        assert_eq!(contiguous_runs(&[0, 1, 2, 5, 6, 10], 3), vec![(0, 3)]);
+        assert!(contiguous_runs(&[], 1).is_empty());
+    }
+
+    #[test]
+    fn scoring_skips_starved_paths() {
+        let splits = cpcv_splits(120, 6, 2, 5, 2);
+        let vals = score_cpcv_paths(&splits, 5, |lo, hi| (hi - lo) as f64);
+        // 15 paths minus starved ones; every scored run has len >= 5.
+        assert!(!vals.is_empty() && vals.len() < 15 * 2);
+        assert!(vals.iter().all(|v| *v >= 5.0));
     }
 
     #[test]

@@ -85,7 +85,10 @@ pub struct ResearchInput {
     pub walkforward: Option<WalkForwardReport>,
     pub montecarlo: Option<MonteCarloReport>,
     pub cpcv_paths: usize,
+    pub cpcv_runs_scored: usize,
     pub cpcv_median_oos: f64,
+    pub cpcv_p25_oos: f64,
+    pub cpcv_p75_oos: f64,
     pub pbo: Option<PboReport>,
     pub sensitivity: Vec<SensitivityReport>,
     pub cost_stress: Vec<CostStressRow>,
@@ -136,6 +139,20 @@ pub fn report_json(r: &ResearchInput) -> String {
         o.push_str(&format!(
             "\"overfitting\":{{\"configs_tested\":{},\"pbo\":{:.4},\"degradation\":{:.4},\"assessment\":{}}},",
             p.configs_tested, p.pbo, p.degradation, jestr(p.assessment)
+        ));
+    }
+    o.push_str(&format!(
+        "\"cpcv\":{{\"paths\":{},\"runs_scored\":{},\"median_oos\":{:.6},\"p25_oos\":{:.6},\"p75_oos\":{:.6}}},",
+        r.cpcv_paths, r.cpcv_runs_scored, r.cpcv_median_oos, r.cpcv_p25_oos, r.cpcv_p75_oos
+    ));
+    if let Some(w) = &r.walkforward {
+        o.push_str(&format!(
+            "\"walkforward\":{{\"folds\":{},\"positive_oos_fraction\":{:.4},\"median_oos_sharpe\":{:.4},\"worst_oos_dd\":{:.6},\"stable\":{}}},",
+            w.folds.len(),
+            w.positive_oos_fraction,
+            w.median_oos_sharpe,
+            w.worst_oos_dd,
+            w.stable
         ));
     }
     o.push_str(&format!("\"cost_verdict\":{},", jestr(&r.cost_verdict)));
@@ -234,7 +251,7 @@ pub fn report_markdown(r: &ResearchInput) -> String {
             mc.boot_sharpe.p5,
         ));
     }
-    o.push_str(&format!("## 11. CPCV\n- Paths: {} | Median OOS score: {:.4}\n", r.cpcv_paths, r.cpcv_median_oos));
+    o.push_str(&format!("## 11. CPCV\n- Paths: {} | Runs scored: {} | Median OOS return: {:.4}% (p25 {:.4}% / p75 {:.4}%)\n", r.cpcv_paths, r.cpcv_runs_scored, r.cpcv_median_oos * 100.0, r.cpcv_p25_oos * 100.0, r.cpcv_p75_oos * 100.0));
     o.push_str("- White's Reality Check: NOT IMPLEMENTED. Hansen SPA: NOT IMPLEMENTED.\n- Reason: insufficient statistical assumptions / data requirements — reported honestly, never faked.\n\n");
     if let Some(p) = &r.pbo {
         o.push_str("## 12. PBO / Overfitting\n");

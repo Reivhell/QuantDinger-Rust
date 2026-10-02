@@ -1108,7 +1108,118 @@ fn main() {
     for f in [1.0, 2.5, 0.1] {
         mvec.push(format!("\"{}\"", mf::Meta::Float(f).dump()));
     }
-    out += &format!("\"mani\":[{}]\n", mvec.join(","));
+    out += &format!("\"mani\":[{}],\n", mvec.join(","));
+
+    // json_helpers vectors: parsed+re-emitted docs (raw JSON embeds) + passthrough.
+    use qd_engine::json_helpers as jh;
+    let jdocs: &[&str] = &[
+        r#"{"a":1,"b":[1.5,-2e-3,true,null,"x"]}"#,
+        "{\"caf\u{00e9}\":\"A\",\"emoji\":\"\u{1f600}\",\"esc\":\"A\\n\\t\\\"q\\\"\\\\\"}",
+        "[1,2,3]",
+        "\"s\"",
+        "123",
+        "-0.5",
+        "1E+16",
+        "{\"big\":123456789123456789123456789}",
+        "{\"x\":1.5e-7}",
+        "  { \"w\" : [ true , false ] }  ",
+        "\"a\\uD83D\\uDE00b\"",
+        "",
+        "   ",
+        "{bad",
+        "[1,]",
+        "01",
+        "{\"a\":1} x",
+        "123abc",
+        "nul",
+    ];
+    let jdef = jh::JsonVal::Obj(vec![("d".to_string(), jh::JsonVal::Num("1".to_string()))]);
+    let mut jres: Vec<String> = Vec::new();
+    for d in jdocs {
+        jres.push(jh::safe_json_loads(&jh::JsonInput::Text(d.to_string()), &jdef).dump());
+    }
+    // Value passthrough (dict + list inputs return as-is).
+    jres.push(
+        jh::safe_json_loads(
+            &jh::JsonInput::Value(jh::JsonVal::Obj(vec![(
+                "k".to_string(),
+                jh::JsonVal::Num("1".to_string()),
+            )])),
+            &jdef,
+        )
+        .dump(),
+    );
+    jres.push(
+        jh::safe_json_loads(
+            &jh::JsonInput::Value(jh::JsonVal::Arr(vec![jh::JsonVal::Bool(true)])),
+            &jdef,
+        )
+        .dump(),
+    );
+    out += &format!("\"jres\":[{}],\n", jres.join(","));
+
+    // notification_display vectors: payload/template/params → merged dict dump.
+    use qd_engine::notification_display as nd;
+    let nparams = vec![
+        ("symbol".to_string(), jh::JsonVal::Str("BTC".to_string())),
+        ("n".to_string(), jh::JsonVal::Num("2".to_string())),
+        ("px".to_string(), jh::JsonVal::Num("100.5".to_string())),
+    ];
+    let npay1 = vec![
+        ("title".to_string(), jh::JsonVal::Str("T".into())),
+        ("body".to_string(), jh::JsonVal::Str("B".into())),
+    ];
+    let npay2 = vec![
+        ("a".to_string(), jh::JsonVal::Num("1".into())),
+        ("display".to_string(), jh::JsonVal::Str("stale".into())),
+    ];
+    let mut nres: Vec<String> = Vec::new();
+    for (pay, tpl, prm) in [(&npay1[..], "fill", &nparams[..]), (&npay2[..], "t", &[][..]), (&[][..], "x", &[][..])] {
+        let merged = nd::with_display(pay, tpl, prm);
+        nres.push(jh::JsonVal::Obj(merged).dump());
+    }
+    out += &format!("\"notif\":[{}],\n", nres.join(","));
+
+    // local_brokers vectors: env value (or null=unset) → [allowed, require_ok].
+    use qd_engine::local_brokers as lb;
+    let lvals: &[Option<&str>] = &[
+        None,
+        Some("1"),
+        Some("true"),
+        Some("YES"),
+        Some(" On "),
+        Some("0"),
+        Some("false"),
+        Some(""),
+        Some("  "),
+        Some("no"),
+        Some("off"),
+    ];
+    let mut lres: Vec<String> = Vec::new();
+    for v in lvals {
+        let mut env = lb::Env::default();
+        if let Some(s) = v {
+            env = env.with("ALLOW_LOCAL_DESKTOP_BROKERS", s);
+        }
+        let ok = lb::require_local_desktop_brokers_allowed(&env).is_ok();
+        lres.push(format!(
+            "[{},{}]",
+            match v {
+                Some(s) => jstr(s),
+                None => "null".to_string(),
+            },
+            if lb::local_desktop_brokers_allowed(&env) && ok {
+                "[true,true]"
+            } else if !lb::local_desktop_brokers_allowed(&env) && !ok {
+                "[false,false]"
+            } else {
+                "[\"MISMATCH\",\"MISMATCH\"]"
+            }
+        ));
+    }
+    // exact reject message, JSON-escaped
+    lres.push(jstr(lb::CLOUD_REJECT_MESSAGE));
+    out += &format!("\"brokers\":[{}]\n", lres.join(","));
     out += "}\n";
     print!("{out}");
 }

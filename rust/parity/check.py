@@ -937,6 +937,78 @@ def main() -> int:
     for i, f in enumerate([1.0, 2.5, 0.1]):
         check(f"mani.float[{i}]", _mv[5 + i], repr(f))
 
+    # --- json_helpers / notification_display / local_brokers ---
+    import json as _json2  # noqa: E402
+    _jh = _load("app.utils.json_helpers", "app/utils/json_helpers.py")
+    _nd = _load("app.utils.notification_display", "app/utils/notification_display.py")
+    _lb = _load("app.utils.local_brokers", "app/utils/local_brokers.py")
+    _py_default = {"d": 1}
+    _jdocs = [
+        '{"a":1,"b":[1.5,-2e-3,true,null,"x"]}',
+        '{"caf\\u00e9":"A","emoji":"\\ud83d\\ude00","esc":"A\\n\\t\\"q\\"\\\\"}',
+        "[1,2,3]",
+        '"s"',
+        "123",
+        "-0.5",
+        "1E+16",
+        '{"big":123456789123456789123456789}',
+        '{"x":1.5e-7}',
+        '  { "w" : [ true , false ] }  ',
+        '"a\\ud83d\\ude00b"',
+        "",
+        "   ",
+        "{bad",
+        "[1,]",
+        "01",
+        '{"a":1} x',
+        "123abc",
+        "nul",
+    ]
+    assert len(vec["jres"]) == len(_jdocs) + 2, len(vec["jres"])
+    for i, d in enumerate(_jdocs):
+        check(f"jres[{i}]", vec["jres"][i],
+              _jh.safe_json_loads(d, dict(_py_default)))
+    check("jres.passthrough.dict", vec["jres"][len(_jdocs)], {"k": 1})
+    check("jres.passthrough.list", vec["jres"][len(_jdocs) + 1], [True])
+    # non-str / non-container inputs yield default
+    for other in (None, 5, 1.5, True, (1, 2)):
+        check(f"jres.other.{type(other).__name__}",
+              _jh.safe_json_loads(other, dict(_py_default)), _py_default)
+    _py_notif = [
+        _nd.with_display({"title": "T", "body": "B"}, "fill",
+                         {"symbol": "BTC", "n": 2, "px": 100.5}),
+        _nd.with_display({"a": 1, "display": "stale"}, "t", {}),
+        _nd.with_display(None, "x", {}),
+    ]
+    assert len(vec["notif"]) == 3, len(vec["notif"])
+    for i, p in enumerate(_py_notif):
+        check(f"notif[{i}]", vec["notif"][i], p)
+    _lvals = [None, "1", "true", "YES", " On ", "0", "false", "", "  ", "no", "off"]
+    assert len(vec["brokers"]) == len(_lvals) + 1, len(vec["brokers"])
+    for i, v in enumerate(_lvals):
+        saved_lb = _os.environ.get("ALLOW_LOCAL_DESKTOP_BROKERS")
+        try:
+            _os.environ.pop("ALLOW_LOCAL_DESKTOP_BROKERS", None)
+            if v is not None:
+                _os.environ["ALLOW_LOCAL_DESKTOP_BROKERS"] = v
+            py_allowed = _lb.local_desktop_brokers_allowed()
+            try:
+                _lb.require_local_desktop_brokers_allowed()
+                py_ok, py_msg = True, ""
+            except PermissionError as e:
+                py_ok, py_msg = False, str(e)
+        finally:
+            _os.environ.pop("ALLOW_LOCAL_DESKTOP_BROKERS", None)
+            if saved_lb is not None:
+                _os.environ["ALLOW_LOCAL_DESKTOP_BROKERS"] = saved_lb
+        rust_v, rust_flags = vec["brokers"][i]
+        check(f"brokers[{i}].env", rust_v, v)
+        check(f"brokers[{i}].flags", rust_flags, [py_allowed, py_ok])
+        if not py_ok:
+            check(f"brokers[{i}].msg", vec["brokers"][len(_lvals)], py_msg)
+    check("brokers.msg", vec["brokers"][len(_lvals)],
+          _lb.desktop_broker_cloud_reject_message())
+
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")
         return 1

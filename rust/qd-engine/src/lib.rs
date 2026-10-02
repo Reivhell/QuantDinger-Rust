@@ -52,6 +52,11 @@ pub mod instruments;
 pub mod grid;
 pub mod indicators;
 pub mod language;
+pub mod json_helpers;
+/// Notification display metadata (`utils/notification_display.py`).
+pub mod notification_display;
+/// IBKR desktop-broker deployment policy (`utils/local_brokers.py`).
+pub mod local_brokers;
 pub mod manifest;
 pub mod market_visibility;
 pub mod net_pnl;

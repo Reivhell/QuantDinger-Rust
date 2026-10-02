@@ -77,6 +77,7 @@ _load_function_only(
     "normalize_strategy_symbol",
 )
 _load("app.utils.numeric_precision", "app/utils/numeric_precision.py")
+_load("app.utils.market_visibility", "app/utils/market_visibility.py")
 _load("app.utils.pnl", "app/utils/pnl.py")
 _load("app.utils.risk_guard", "app/utils/risk_guard.py")
 _load("app.utils.technical_indicators", "app/utils/technical_indicators.py")
@@ -615,6 +616,44 @@ def main() -> int:
     _py_bands = py_bands(list(py_default_bands))
     for i, v in enumerate(_band_vals):
         check(f"bands[{i}]", vec["bands"][i], [v, py_classify(v, _py_bands)])
+
+    # --- market_visibility: env matrix through real Python via monkeypatched getenv ---
+    import os as _os  # noqa: E402
+    from app.utils.market_visibility import (  # noqa: E402
+        filter_market_items as py_filter,
+        hidden_markets as py_hidden,
+        is_market_visible as py_visible,
+    )
+    _mv_markets = ["Crypto", "USStock", "CNStock", "HKStock", "Forex", "Futures",
+                   "MOEX", "", "Unknown", " crypto "]
+    _mv_items = ["Crypto", "CNStock", "  ",
+                 {"value": "USStock"}, {"value": "CNStock"}, {"other": "Crypto"}]
+    assert len(vec["mvis"]) == 7
+    _real_getenv = _os.getenv
+    for i, row in enumerate(vec["mvis"]):
+        name, vis, hidden, kept, varlist = row
+        saved: dict = {}
+        try:
+            for k in ("ENABLED_MARKETS", "SHOW_CN_STOCK", "SHOW_HK_STOCK"):
+                if k in _os.environ:
+                    saved[k] = _os.environ[k]
+                    del _os.environ[k]
+            for k, v in varlist:
+                _os.environ[k] = v
+            py_vis = [py_visible(m) for m in _mv_markets]
+            py_hidden_sorted = sorted(py_hidden())
+            py_kept = []
+            for it in py_filter(_mv_items):
+                py_kept.append(f"S:{it}" if isinstance(it, str)
+                               else f"M:{it.get('value', '')}")
+        finally:
+            for k in ("ENABLED_MARKETS", "SHOW_CN_STOCK", "SHOW_HK_STOCK"):
+                _os.environ.pop(k, None)
+            _os.environ.update(saved)
+        check(f"mvis[{i}].name", name, vec["mvis"][i][0])
+        check(f"mvis[{i}].vis", vis, py_vis)
+        check(f"mvis[{i}].hidden", hidden, py_hidden_sorted)
+        check(f"mvis[{i}].kept", kept, py_kept)
 
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")

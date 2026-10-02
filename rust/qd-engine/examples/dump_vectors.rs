@@ -6,8 +6,8 @@
 use qd_engine::close_reason::{self, ExecRowIn, NumVal, TradeRowIn};
 use qd_engine::{
     curve_sampling::{self, CurvePoint},
-    frequencies, grid, indicators, instruments, net_pnl, perf_metrics, pnl, precise,
-    protection, risk_guard,
+    frequencies, grid, indicators, instruments, market_visibility, net_pnl, perf_metrics,
+    pnl, precise, protection, risk_guard,
 };
 use qd_engine::net_pnl::TradeRow;
 
@@ -724,7 +724,73 @@ fn main() {
             ))
         ));
     }
-    out += &format!("\"bands\":[{}]\n", bv.join(","));
+    out += &format!("\"bands\":[{}],\n", bv.join(","));
+
+    // market_visibility vectors: env cases x market probes + filter + hidden.
+    let mv_cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("default", vec![]),
+        ("cn_yes_hk_no", vec![("SHOW_CN_STOCK", "yes"), ("SHOW_HK_STOCK", "0")]),
+        ("cn_true_ws", vec![("SHOW_CN_STOCK", "  True ")]),
+        (
+            "whitelist",
+            vec![("ENABLED_MARKETS", "Crypto, USStock"), ("SHOW_CN_STOCK", "true")],
+        ),
+        ("whitelist_messy", vec![("ENABLED_MARKETS", " Crypto ,,USStock, ")]),
+        ("whitelist_empty", vec![("ENABLED_MARKETS", "")]),
+        ("whitelist_hk_only", vec![("ENABLED_MARKETS", "HKStock")]),
+    ];
+    let mv_markets = [
+        "Crypto", "USStock", "CNStock", "HKStock", "Forex", "Futures", "MOEX", "",
+        "Unknown", " crypto ",
+    ];
+    let mut mv: Vec<String> = Vec::new();
+    for (name, vars) in &mv_cases {
+        let mut env = market_visibility::Env::default();
+        for (k, v) in vars {
+            env = env.with(k, v);
+        }
+        let vis: Vec<bool> =
+            mv_markets.iter().map(|m| market_visibility::is_market_visible(&env, m)).collect();
+        let mut hidden: Vec<String> =
+            market_visibility::hidden_markets(&env).into_iter().collect();
+        hidden.sort();
+        let items = vec![
+            market_visibility::MarketItem::Str("Crypto".into()),
+            market_visibility::MarketItem::Str("CNStock".into()),
+            market_visibility::MarketItem::Str("  ".into()),
+            market_visibility::MarketItem::Map(
+                [("value".to_string(), "USStock".to_string())].into_iter().collect(),
+            ),
+            market_visibility::MarketItem::Map(
+                [("value".to_string(), "CNStock".to_string())].into_iter().collect(),
+            ),
+            market_visibility::MarketItem::Map(
+                [("other".to_string(), "Crypto".to_string())].into_iter().collect(),
+            ),
+        ];
+        let kept = market_visibility::filter_market_items(&env, &items, "value");
+        let kept_dbg: Vec<String> = kept
+            .iter()
+            .map(|it| match it {
+                market_visibility::MarketItem::Str(s) => format!("S:{s}"),
+                market_visibility::MarketItem::Map(m) => {
+                    format!("M:{}", m.get("value").map(String::as_str).unwrap_or(""))
+                }
+            })
+            .collect();
+        let vis_s = vis.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
+        let hid_s = hidden.iter().map(|s| jstr(s)).collect::<Vec<_>>().join(",");
+        let kept_s = kept_dbg.iter().map(|s| jstr(s)).collect::<Vec<_>>().join(",");
+        mv.push(format!(
+            "[{},[{}],[{}],[{}],[{}]]",
+            jstr(name),
+            vis_s,
+            hid_s,
+            kept_s,
+            vars.iter().map(|(k, v)| format!("[{},{}]", jstr(k), jstr(v))).collect::<Vec<_>>().join(",")
+        ));
+    }
+    out += &format!("\"mvis\":[{}]\n", mv.join(","));
     out += "}\n";
     print!("{out}");
 }

@@ -24,6 +24,8 @@
 //!   (instrument parsing, market inference, index/pool references)
 //! - `perf_metrics` — pure-math core of `app/services/backtest/metrics.py`
 //!   (information ratio, band classification, level cleaning)
+//! - `market_visibility` — `app/utils/market_visibility.py`
+//!   (operator-controlled market visibility: ENABLED_MARKETS + SHOW_* flags)
 
 pub mod close_reason;
 pub mod curve_sampling;
@@ -32,6 +34,7 @@ pub mod instruments;
 
 pub mod grid;
 pub mod indicators;
+pub mod market_visibility;
 pub mod net_pnl;
 pub mod perf_metrics;
 pub mod pnl;

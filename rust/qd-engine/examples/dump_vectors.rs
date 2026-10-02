@@ -998,7 +998,54 @@ fn main() {
             lang::detect_request_language(&req, dflt)
         ));
     }
-    out += &format!("\"lang\":[{}]\n", lvec.join(","));
+    out += &format!("\"lang\":[{}],\n", lvec.join(","));
+
+    // timeutil vectors: epoch / millis / strings / aware / bad.
+    use qd_engine::timeutil as tu;
+    let mut tvec: Vec<String> = Vec::new();
+    let num_cases = [0.0, 1_767_225_600.0, 1_767_225_600_123.0, 1.0, -1.0];
+    for ts in num_cases {
+        match tu::to_utc_iso_naive(&tu::TimeInput::Epoch(ts)) {
+            Some(s) => tvec.push(format!("\"{s}\"")),
+            None => tvec.push("null".to_string()),
+        }
+    }
+    let str_cases = [
+        "2026-01-01T00:00:00Z",
+        "2026-01-01 00:00:00",
+        "2026-01-01",
+        "2026-01-01T08:00:00+08:00",
+        "2026-01-01T08:00:00+0800",
+        "2026-01-01T00:00:00.123456",
+        "  2026-01-01T00:00:00Z  ",
+        "2026-01-01T00:00:00.5+02:00",
+        "",
+        "   ",
+        "not-a-date",
+        "2026-13-01",
+        "2026-01-01T25:00:00",
+        "2026-01-01T00:00:00+99:99",
+    ];
+    for s in str_cases {
+        match tu::to_utc_iso_naive(&tu::TimeInput::Text(s.into())) {
+            Some(o) => tvec.push(format!("[{},{}]", jstr(s), jstr(&o))),
+            None => tvec.push(format!("[{},null]", jstr(s))),
+        }
+    }
+    // aware: 2026-01-01 00:00 +08:00 → 2025-12-31T16:00:00Z
+    tvec.push(format!(
+        "\"{}\"",
+        tu::to_utc_iso_naive(&tu::TimeInput::Aware {
+            epoch: 1_767_225_600.0,
+            offset: 8 * 3_600
+        })
+        .unwrap()
+    ));
+    match tu::to_utc_iso_naive(&tu::TimeInput::Other) {
+        Some(s) => tvec.push(format!("\"{s}\"")),
+        None => tvec.push("null".to_string()),
+    }
+    out += &format!("\"tutil\":[{}]\n", tvec.join(","));
     out += "}\n";
     print!("{out}");
 }

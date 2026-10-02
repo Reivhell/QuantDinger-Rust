@@ -36,6 +36,9 @@
 //!   (universe-history gate, warmup-bar counts, fundamental-field checks)
 //! - `language` — `app/utils/language.py`
 //!   (UI-language tag normalization + request-priority detection)
+//! - `timeutil` — `to_utc_iso` from `app/utils/timeutil.py`
+//!   (epoch/ISO/aware inputs → UTC `Z` strings; naive = UTC wall clock,
+//!   non-UTC naive zones stay Python-side)
 
 pub mod close_reason;
 pub mod curve_sampling;
@@ -55,3 +58,4 @@ pub mod protection;
 pub mod readiness;
 pub mod risk_guard;
 pub mod snapshot;
+pub mod timeutil;

@@ -80,6 +80,7 @@ _load("app.utils.numeric_precision", "app/utils/numeric_precision.py")
 _load("app.utils.market_visibility", "app/utils/market_visibility.py")
 _load("app.utils.pnl", "app/utils/pnl.py")
 _load("app.utils.language", "app/utils/language.py")
+_load("app.utils.timeutil", "app/utils/timeutil.py")
 _load("app.utils.risk_guard", "app/utils/risk_guard.py")
 _load("app.utils.technical_indicators", "app/utils/technical_indicators.py")
 _load("app.utils.trade_net_pnl", "app/utils/trade_net_pnl.py")
@@ -869,6 +870,36 @@ def main() -> int:
         req = _Req(headers=h, args=q)
         check(f"lang.detect[{i}]", vec["lang"][len(_norm_cases) + i],
               py_detect(req, body if body else None, dflt))
+
+    # --- timeutil: same inputs through the real to_utc_iso ---
+    import datetime as _dtime  # noqa: E402
+    from app.utils.timeutil import to_utc_iso as py_to_utc  # noqa: E402
+    _num_cases = [0.0, 1_767_225_600.0, 1_767_225_600_123.0, 1.0, -1.0]
+    assert len(vec["tutil"]) == len(_num_cases) + 14 + 2, len(vec["tutil"])
+    for i, ts in enumerate(_num_cases):
+        check(f"tutil.num[{i}]", vec["tutil"][i], py_to_utc(ts))
+    _str_cases = [
+        "2026-01-01T00:00:00Z",
+        "2026-01-01 00:00:00",
+        "2026-01-01",
+        "2026-01-01T08:00:00+08:00",
+        "2026-01-01T08:00:00+0800",
+        "2026-01-01T00:00:00.123456",
+        "  2026-01-01T00:00:00Z  ",
+        "2026-01-01T00:00:00.5+02:00",
+        "",
+        "   ",
+        "not-a-date",
+        "2026-13-01",
+        "2026-01-01T25:00:00",
+        "2026-01-01T00:00:00+99:99",
+    ]
+    for i, s in enumerate(_str_cases):
+        check(f"tutil.str[{i}]", vec["tutil"][len(_num_cases) + i],
+              [s, py_to_utc(s)])
+    _aware = _dtime.datetime(2026, 1, 1, tzinfo=_dtime.timezone(_dtime.timedelta(hours=8)))
+    check("tutil.aware", vec["tutil"][len(_num_cases) + 14], py_to_utc(_aware))
+    check("tutil.other", vec["tutil"][len(_num_cases) + 15], py_to_utc(object()))
 
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")

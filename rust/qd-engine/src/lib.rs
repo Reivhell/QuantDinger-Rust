@@ -29,6 +29,9 @@
 //! - `data_portal` — pandas-free logic of
 //!   `app/services/strategy_v2/data.py` (point-in-time windowing, key
 //!   resolution, frame normalization)
+//! - `snapshot` — content-addressing core of
+//!   `app/services/strategy_v2/snapshot.py` (canonical snapshot bytes,
+//!   Python-float rendering, id validation)
 
 pub mod close_reason;
 pub mod curve_sampling;
@@ -45,3 +48,4 @@ pub mod pnl;
 pub mod precise;
 pub mod protection;
 pub mod risk_guard;
+pub mod snapshot;

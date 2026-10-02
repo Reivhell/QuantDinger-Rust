@@ -879,7 +879,34 @@ fn main() {
     };
     dvec.push(format!("\"{}\"", dp::normalize_frame("USStock:K", &confl).unwrap_err()));
     dvec.push(format!("\"{}\"", jstr(&psym).replace('"', "")));
-    out += &format!("\"dportal\":[{}]\n", dvec.join(","));
+    out += &format!("\"dportal\":[{}],\n", dvec.join(","));
+
+    // snapshot vectors: canonical bytes + float rendering + id checks.
+    use qd_engine::snapshot as sn;
+    let srows: Vec<sn::SnapshotRow> = vec![
+        sn::SnapshotRow { ns: 1_767_254_400_000_000_000, values: vec![102.3, 103.3, 101.3, 102.7, 12.0] },
+        sn::SnapshotRow { ns: 1_767_225_600_000_000_000, values: vec![100.1, 101.1, 99.1, 100.8, 10.0] },
+        sn::SnapshotRow { ns: 1_767_240_000_000_000_000, values: vec![101.2, 102.2, 100.2, 101.9, 11.0] },
+        // dupe keeps last
+        sn::SnapshotRow { ns: 1_767_225_600_000_000_000, values: vec![100.1, 101.1, 99.1, 100.8, 10.0] },
+    ];
+    let sn_bytes = sn::canonical_frame_bytes(&["open", "high", "low", "close", "volume"], &srows).unwrap();
+    let mut svec: Vec<String> = vec![format!(
+        "\"{}\"",
+        String::from_utf8(sn_bytes.clone()).unwrap().replace('"', "'")
+    )];
+    // sha256 of the bytes (compared with hashlib in check.py)
+    svec.push(format!("\"{}\"", sn::sha256_hex(&sn_bytes)));
+    for v in [100.0, 0.1, 1e16, 1e-7, -2.5e100, 123456789.123456789] {
+        svec.push(format!("\"{}\"", sn::py_float_repr(v).unwrap()));
+    }
+    for id in ["xyz", &"A".repeat(64), &("ab".repeat(32))] {
+        match sn::validate_snapshot_id(id) {
+            Ok(n) => svec.push(format!("\"ok:{n}\"")),
+            Err(e) => svec.push(format!("\"ERR:{e}\"")),
+        }
+    }
+    out += &format!("\"snap\":[{}]\n", svec.join(","));
     out += "}\n";
     print!("{out}");
 }

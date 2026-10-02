@@ -88,6 +88,7 @@ _load("app.services.strategy_v2.models", "app/services/strategy_v2/models.py")
 _load("app.services.market_schedule", "app/services/market_schedule.py")
 _load("app.services.backtest_metrics", "app/services/backtest/metrics.py")
 _load("app.services.strategy_v2.instruments", "app/services/strategy_v2/instruments.py")
+_load("app.services.strategy_v2.snapshot_mod", "app/services/strategy_v2/snapshot.py")
 _load("app.services.strategy_v2.data_portal", "app/services/strategy_v2/data.py")
 _load("app.services.strategy_v2.curve_sampling", "app/services/strategy_v2/curve_sampling.py")
 _prot = _load("app.services.strategy_v2.protection", "app/services/strategy_v2/protection.py")
@@ -732,6 +733,30 @@ def main() -> int:
         _e3 = str(e)
     check("dportal.err.confl", _dp[11], _e3)
     check("dportal.symbol", _dp[12], "BTC/USDT")
+
+    # --- snapshot: canonical bytes + float rendering + id checks ---
+    import hashlib as _hl  # noqa: E402
+    from app.services.strategy_v2.snapshot_mod import (  # noqa: E402
+        canonical_frame_bytes as py_canon,
+    )
+    _sidx = pd.date_range("2026-01-01", periods=3, freq="4h")
+    _sframe = pd.DataFrame(
+        {"open": [100.1, 101.2, 102.3], "high": [101.1, 102.2, 103.3],
+         "low": [99.1, 100.2, 101.3], "close": [100.8, 101.9, 102.7],
+         "volume": [10.0, 11.0, 12.0]},
+        index=_sidx,
+    )
+    _py_bytes = py_canon(_sframe)
+    _py_hex = _hl.sha256(_py_bytes).hexdigest()
+    _sn = vec["snap"]
+    assert len(_sn) == 11, len(_sn)
+    check("snap.bytes", _sn[0].replace("'", '"'), _py_bytes.decode("utf-8"))
+    check("snap.sha256", _sn[1], _py_hex)
+    for i, v in enumerate([100.0, 0.1, 1e16, 1e-7, -2.5e100, 123456789.123456789]):
+        check(f"snap.repr[{i}]", _sn[2 + i], repr(v))
+    check("snap.id.bad", _sn[8], "ERR:strategyV2.snapshotIdInvalid")
+    check("snap.id.upper", _sn[9], "ok:" + "a" * 64)
+    check("snap.id.ok", _sn[10], f"ok:{'ab' * 32}")
 
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")

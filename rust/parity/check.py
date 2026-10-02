@@ -79,6 +79,7 @@ _load_function_only(
 _load("app.utils.numeric_precision", "app/utils/numeric_precision.py")
 _load("app.utils.market_visibility", "app/utils/market_visibility.py")
 _load("app.utils.pnl", "app/utils/pnl.py")
+_load("app.utils.language", "app/utils/language.py")
 _load("app.utils.risk_guard", "app/utils/risk_guard.py")
 _load("app.utils.technical_indicators", "app/utils/technical_indicators.py")
 _load("app.utils.trade_net_pnl", "app/utils/trade_net_pnl.py")
@@ -832,6 +833,42 @@ def main() -> int:
     check("ready.caldate", _rdy[9],
           str((_dt.datetime(2025, 12, 31, 23, tzinfo=_dt.timezone.utc)
                + _dt.timedelta(hours=2)).date()))
+
+    # --- language: normalize + detect through the real helpers ---
+    from app.utils.language import (  # noqa: E402
+        _normalize_lang as py_norm_lang,
+        detect_request_language as py_detect,
+    )
+
+    class _Headers(dict):
+        def get(self, key, default=None):
+            return super().get(key, default)
+
+    class _Req:
+        def __init__(self, headers=None, args=None):
+            self.headers = _Headers(headers or {})
+            self.args = _Headers(args or {})
+
+    _norm_cases = ["en", "en-US,en;q=0.9", " zh-hans ", "zh-Hant", "JA-jp",
+                   "fr-FR; q=0.8", "", "   ", "xx-YY", "en;",
+                   "KO-kr;q=0.5, en;q=0.3", "zh"]
+    assert len(vec["lang"]) == len(_norm_cases) + 5
+    for i, raw in enumerate(_norm_cases):
+        check(f"lang.norm[{i}]", vec["lang"][i], [raw, py_norm_lang(raw)])
+    _det_cases = [
+        ({"X-App-Lang": "ja-JP", "Accept-Language": "ko-KR"},
+         {"language": "fr-FR"}, {"language": "de-DE"}, "en-US"),
+        ({"X-App-Lang": "xx"}, {"language": "fr-FR"}, {}, "en-US"),
+        ({}, {}, {"language": "th-TH"}, "en-US"),
+        ({}, {}, {}, "zh-CN"),
+        ({}, {"language": "xx"}, {}, "en-US"),
+    ]
+    # 5th case also exercises Accept-Language fallback via header
+    _det_cases[4][0]["Accept-Language"] = "ar-SA"
+    for i, (h, body, q, dflt) in enumerate(_det_cases):
+        req = _Req(headers=h, args=q)
+        check(f"lang.detect[{i}]", vec["lang"][len(_norm_cases) + i],
+              py_detect(req, body if body else None, dflt))
 
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")

@@ -964,7 +964,41 @@ fn main() {
     // cal_date probe: 2025-12-31 23:00 UTC +2h offset → 2026-01-01 local
     let (y, m, d) = rd::cal_date(rd::Zoned { epoch: RB - 3_600, offset: 7_200 });
     rvec.push(format!("\"{y:04}-{m:02}-{d:02}\""));
-    out += &format!("\"ready\":[{}]\n", rvec.join(","));
+    out += &format!("\"ready\":[{}],\n", rvec.join(","));
+
+    // language vectors: normalize probes + detect-priority probes.
+    use qd_engine::language as lang;
+    let norm_cases = [
+        "en", "en-US,en;q=0.9", " zh-hans ", "zh-Hant", "JA-jp", "fr-FR; q=0.8",
+        "", "   ", "xx-YY", "en;", "KO-kr;q=0.5, en;q=0.3", "zh",
+    ];
+    let mut lvec: Vec<String> = Vec::new();
+    for raw in norm_cases {
+        match lang::normalize_lang(raw) {
+            Some(l) => lvec.push(format!("[{},{}]", jstr(raw), jstr(&l))),
+            None => lvec.push(format!("[{},null]", jstr(raw))),
+        }
+    }
+    let det_cases: Vec<(Option<&str>, Option<&str>, Option<&str>, Option<&str>, &str)> = vec![
+        (Some("ja-JP"), Some("fr-FR"), Some("de-DE"), Some("ko-KR"), "en-US"),
+        (Some("xx"), Some("fr-FR"), None, None, "en-US"),
+        (None, None, Some("th-TH"), None, "en-US"),
+        (None, None, None, None, "zh-CN"),
+        (None, Some("xx"), None, Some("ar-SA"), "en-US"),
+    ];
+    for (h, b, q, a, dflt) in &det_cases {
+        let req = lang::RequestParts {
+            header_app_lang: *h,
+            body_language: *b,
+            query_language: *q,
+            header_accept_language: *a,
+        };
+        lvec.push(format!(
+            "\"{}\"",
+            lang::detect_request_language(&req, dflt)
+        ));
+    }
+    out += &format!("\"lang\":[{}]\n", lvec.join(","));
     out += "}\n";
     print!("{out}");
 }

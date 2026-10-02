@@ -34,6 +34,8 @@
 //!   Python-float rendering, id validation)
 //! - `readiness` — `app/services/strategy_v2/readiness.py`
 //!   (universe-history gate, warmup-bar counts, fundamental-field checks)
+//! - `language` — `app/utils/language.py`
+//!   (UI-language tag normalization + request-priority detection)
 
 pub mod close_reason;
 pub mod curve_sampling;
@@ -43,6 +45,7 @@ pub mod instruments;
 
 pub mod grid;
 pub mod indicators;
+pub mod language;
 pub mod market_visibility;
 pub mod net_pnl;
 pub mod perf_metrics;

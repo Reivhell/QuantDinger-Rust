@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "qd-engine"
 version = "0.1.0"
+
+[[package]]
+name = "qd-research"
+version = "0.1.0"
+dependencies = [
+ "qd-engine",
+]

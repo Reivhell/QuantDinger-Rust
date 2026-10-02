@@ -1,0 +1,13 @@
+[package]
+name = "qd-research"
+version = "0.1.0"
+edition = "2021"
+description = "Statistical trading-research and validation layer (features, regimes, event backtester, robustness). Depends only on qd-engine + std."
+license = "Apache-2.0"
+
+[dependencies]
+qd-engine = { path = "../qd-engine" }
+
+[lib]
+name = "qd_research"
+path = "src/lib.rs"

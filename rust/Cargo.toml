@@ -1,3 +1,3 @@
 [workspace]
-members = ["qd-engine"]
+members = ["qd-engine", "qd-research"]
 resolver = "2"

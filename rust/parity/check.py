@@ -1388,6 +1388,153 @@ def main() -> int:
         _probef = _PyFernet(_b64.urlsafe_b64encode(_hl.sha256(b"probe-key").digest()))
         check("cenc.none", _probef.decrypt(_none_tok.encode()).decode(), "")
 
+    # --- direction + contract_builders: AST-free slice vs real modules ---
+    _stub("app.services.factors")
+    _load("app.services.factors.registry", "app/services/factors/registry.py")
+    _load("app.services.factors.talib_adapter", "app/services/factors/talib_adapter.py")
+    _load("app.services.factors", "app/services/factors/__init__.py")
+    _sd = _load("app.services.strategy_direction", "app/services/strategy_direction.py")
+    _load("app.utils.safe_exec", "app/utils/safe_exec.py")
+    _contract = _load("app.services.strategy_v2.contract", "app/services/strategy_v2/contract.py")
+    _instr = sys.modules["app.services.strategy_v2.instruments"]
+
+    for i, _row in enumerate(vec["dvec"]):
+        _inp = _row[0]
+        check(f"dvec[{i}].norm", _row[1], _sd.normalize_direction_mode(_inp))
+        check(f"dvec[{i}].side", _row[2], _sd.direction_mode_position_side(_inp))
+        check(f"dvec[{i}].legs", _row[3], ",".join(sorted(_sd.direction_mode_owned_legs(_inp))))
+        check(f"dvec[{i}].long", _row[4], _sd.direction_mode_allows(_inp, "long"))
+        check(f"dvec[{i}].short", _row[5], _sd.direction_mode_allows(_inp, "short"))
+    for i, _row in enumerate(vec["dman"]):
+        check(f"dman[{i}]", _row[1], _sd.direction_mode_from_manifest(_row[0]))
+    for i, _row in enumerate(vec["chash"]):
+        check(f"chash[{i}]", _row[1], _contract.strategy_source_code_hash(_row[0]))
+    for i, _row in enumerate(vec["cdetect"]):
+        check(f"cdetect[{i}]", _row[1], _contract.is_strategy_v2_code(_row[0]))
+
+    def _py_many(_js):
+        try:
+            return ",".join(_it.key for _it in _contract._parse_many(_js))
+        except _contract.StrategyV2ContractError as _e:
+            return f"ERR:C:{_e.code}"
+        except _instr.InstrumentParseError as _e:
+            return f"ERR:C:{_e}"
+        except ValueError:
+            return "ERR:V"
+        except TypeError as _e:
+            return f"ERR:T:{_e}"
+
+    for i, _row in enumerate(vec["pmany"]):
+        check(f"pmany[{i}]", _row[1], _py_many(_row[0]))
+
+    def _on_open():
+        pass
+
+    def _kw_cb():
+        pass
+
+    _on_open.__name__ = "on_open"
+    _kw_cb.__name__ = "kw_cb"
+
+    class _Anon:
+        def __call__(self, *a, **k):
+            pass
+
+    def _py_state(_ctx):
+        _subs = ";".join(
+            f"{_s.frequency}|{','.join(_s.fields)}|{_s.universe_reference}|"
+            f"{','.join(_it.key for _it in _s.instruments)}"
+            for _s in _ctx.subscriptions
+        )
+        _scheds = ";".join(
+            f"{_s.frequency}|{_s.callback}|{_s.time}|"
+            f"{'' if _s.weekday is None else _s.weekday}|"
+            f"{'' if _s.monthday is None else _s.monthday}"
+            for _s in _ctx.schedules
+        )
+        _ml = _ctx.max_leverage
+        return [
+            _ctx.universe_reference,
+            ",".join(_it.key for _it in _ctx.instruments),
+            _subs, _scheds,
+            _ctx.benchmark.key if _ctx.benchmark is not None else None,
+            _ctx.warmup_bars, _ctx.leverage_allowed,
+            "nan" if _ml != _ml else repr(float(_ml)),
+            dict(_ctx.metadata),
+        ]
+
+    _SCEN = [
+        ("u_pool", [lambda c: c.set_universe(pool="my-pool")]),
+        ("u_list", [lambda c: c.set_universe(["USStock:AAPL", "USStock:AAPL", "INDEX:HS300"])]),
+        ("u_str", [lambda c: c.set_universe("BTCUSDT")]),
+        ("u_absent", [lambda c: c.set_universe()]),
+        ("u_pool_empty", [lambda c: c.set_universe(pool="")]),
+        ("u_pool_null", [lambda c: c.set_universe(pool=None)]),
+        ("u_index", [lambda c: c.set_universe(index="INDEX:HS300")]),
+        ("u_dict", [lambda c: c.set_universe({"USStock:AAPL": 1, "MSFT": 2})]),
+        ("u_badsym", [lambda c: c.set_universe("!!!")]),
+        ("bench", [lambda c: c.set_benchmark("MSFT")]),
+        ("bench_bad", [lambda c: c.set_benchmark("")]),
+        ("sub_defaults", [lambda c: c.set_universe(["USStock:AAPL"]),
+                           lambda c: c.subscribe()]),
+        ("sub_custom", [lambda c: c.subscribe(["600519.XSHG"], frequency="1H",
+                                              fields=["Close", " VOL "])]),
+        ("sub_nouniv", [lambda c: c.subscribe(frequency="1d")]),
+        ("warmup_seq", [lambda c: c.set_warmup("20"), lambda c: c.set_warmup("-5"),
+                        lambda c: c.set_warmup(None)]),
+        ("warmup_bad", [lambda c: c.set_warmup("x")]),
+        ("lev_seq", [lambda c: c.allow_leverage("3"), lambda c: c.allow_leverage("0.5"),
+                     lambda c: c.allow_leverage(None)]),
+        ("lev_bad", [lambda c: c.allow_leverage("x")]),
+        ("meta_seq", [lambda c: c.set_metadata({"a": "1"}, b="2"),
+                      lambda c: c.set_metadata("k", "v")]),
+        ("meta_1arg", [lambda c: c.set_metadata("only")]),
+        ("meta_3args", [lambda c: c.set_metadata("a", "b", "c")]),
+        ("sched_daily", [lambda c: c.daily(_on_open, time="09:30")]),
+        ("sched_pos_beats_kw", [lambda c: c.weekly(_Anon(), weekday="3", callback=_kw_cb)]),
+        ("sched_nocb", [lambda c: c.monthly(1)]),
+        ("sched_monthly_def", [lambda c: c.monthly(_on_open)]),
+        ("full", [lambda c: c.set_universe(["USStock:AAPL"]),
+                  lambda c: c.subscribe(),
+                  lambda c: c.set_warmup("50"),
+                  lambda c: c.allow_leverage(2),
+                  lambda c: c.set_metadata(frequency="1d"),
+                  lambda c: c.daily(_on_open, time="09:30")]),
+    ]
+    # bind schedule calls (daily/weekly/monthly) through the real
+    # _ScheduleBindings wrapper; set_*/subscribe go to the context.
+    class _Redirect:
+        """Dispatch set_*/subscribe to ctx, daily/weekly/monthly to bindings."""
+
+        def __init__(self, ctx, sched):
+            object.__setattr__(self, "_ctx", ctx)
+            object.__setattr__(self, "_sched", sched)
+
+        def __getattr__(self, name):
+            if name in ("daily", "weekly", "monthly"):
+                return getattr(object.__getattribute__(self, "_sched"), name)
+            return getattr(object.__getattribute__(self, "_ctx"), name)
+
+    def _py_run_bound(_ops):
+        _ctx = _contract.DiscoveryContext()
+        _both = _Redirect(_ctx, _contract._ScheduleBindings(_ctx))
+        for _op in _ops:
+            try:
+                _op(_both)
+            except _contract.StrategyV2ContractError as _e:
+                return f"ERR:C:{_e.code}"
+            except _instr.InstrumentParseError as _e:
+                return f"ERR:C:{_e}"
+            except TypeError as _e:
+                return f"ERR:T:{_e}"
+            except ValueError:
+                return "ERR:V"
+        return _py_state(_ctx)
+
+    _rust_cvec = {r[0]: r[1] for r in vec["cvec"]}
+    for _name, _ops in _SCEN:
+        check(f"cvec[{_name}]", _rust_cvec[_name], _py_run_bound(_ops))
+
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")
         return 1

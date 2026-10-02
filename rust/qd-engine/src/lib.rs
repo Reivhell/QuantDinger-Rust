@@ -44,9 +44,13 @@
 //!   frequencies, driving frequency, metadata shapes)
 
 pub mod close_reason;
+/// Strategy V2 discovery builders (`services/strategy_v2/contract.py`, AST-free slice).
+pub mod contract_builders;
 /// Credential crypto (`utils/credential_crypto.py`, pure crypto core).
 pub mod credential_crypto;
 pub mod curve_sampling;
+/// Trading-direction capability (`services/strategy_direction.py`, AST-free slice).
+pub mod direction;
 pub mod data_portal;
 pub mod frequencies;
 pub mod instruments;

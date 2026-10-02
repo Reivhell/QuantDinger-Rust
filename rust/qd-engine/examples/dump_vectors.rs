@@ -1376,7 +1376,322 @@ fn main() {
     cenc.push(jstr(&cc::fernet_encrypt_with(csec, b"fixed-vector", 1_767_225_600, [0u8; 16])));
     out += &format!("\"cenc\":[{}],\n", cenc.join(","));
     // key derivation check: base64url(sha256(secret))
-    out += &format!("\"ckey\":{}\n", jstr(&cc::b64url_encode(&cc::fernet_key_bytes(csec))));
+    out += &format!("\"ckey\":{},\n", jstr(&cc::b64url_encode(&cc::fernet_key_bytes(csec))));
+
+    // direction vectors: [input_json, norm, side, legs_csv, allows_long, allows_short]
+    use qd_engine::direction as dr;
+    let dinputs: Vec<jh::JsonVal> = vec![
+        jh::JsonVal::Str("long".into()), jh::JsonVal::Str("BUY".into()),
+        jh::JsonVal::Str("1".into()), jh::JsonVal::Str("1.0".into()),
+        jh::JsonVal::Str("+1".into()), jh::JsonVal::Str("-1".into()),
+        jh::JsonVal::Str("shortonly".into()), jh::JsonVal::Str("net".into()),
+        jh::JsonVal::Str("dual".into()), jh::JsonVal::Str("LONG-ONLY".into()),
+        jh::JsonVal::Str("sideways".into()), jh::JsonVal::Str("".into()),
+        jh::JsonVal::Str("  both  ".into()), jh::JsonVal::Str("neutral".into()),
+        jh::JsonVal::Num("1".into()), jh::JsonVal::Num("1.0".into()),
+        jh::JsonVal::Num("0".into()), jh::JsonVal::Bool(true),
+        jh::JsonVal::Null, jh::JsonVal::Str("one_way".into()),
+    ];
+    let mut drows: Vec<String> = Vec::new();
+    for inp in &dinputs {
+        let legs = dr::direction_mode_owned_legs(inp).join(",");
+        drows.push(format!(
+            "[{},{},{},{},{},{}]",
+            inp.dump(),
+            jstr(&dr::normalize_direction_mode(inp)),
+            jstr(&dr::direction_mode_position_side(inp)),
+            jstr(&legs),
+            dr::direction_mode_allows(inp, &jh::JsonVal::Str("long".into())),
+            dr::direction_mode_allows(inp, &jh::JsonVal::Str("short".into())),
+        ));
+    }
+    out += &format!("\"dvec\":[{}],\n", drows.join(","));
+    // from_manifest probes: [manifest_json, mode]
+    let dman: Vec<Vec<(String, jh::JsonVal)>> = vec![
+        vec![
+            ("directionMode".to_string(), jh::JsonVal::Str("short".into())),
+            ("direction_mode".to_string(), jh::JsonVal::Str("long".into())),
+            ("metadata".to_string(), jh::JsonVal::Obj(vec![("side".to_string(), jh::JsonVal::Str("both".into()))])),
+        ],
+        vec![("metadata".to_string(), jh::JsonVal::Obj(vec![("side".to_string(), jh::JsonVal::Str("both".into()))]))],
+        vec![
+            ("direction_mode".to_string(), jh::JsonVal::Str("bogus".into())),
+            ("metadata".to_string(), jh::JsonVal::Obj(vec![("trade_direction".to_string(), jh::JsonVal::Str("net".into()))])),
+        ],
+        vec![],
+        vec![("metadata".to_string(), jh::JsonVal::Num("1".into()))],
+        vec![("metadata".to_string(), jh::JsonVal::Obj(vec![("position_side".to_string(), jh::JsonVal::Str("SHORT".into()))]))],
+    ];
+    let mut dman_rows: Vec<String> = Vec::new();
+    for m in &dman {
+        dman_rows.push(format!("[{},{}]", jh::JsonVal::Obj(m.clone()).dump(), jstr(&dr::direction_mode_from_manifest(m))));
+    }
+    out += &format!("\"dman\":[{}],\n", dman_rows.join(","));
+
+    // contract_builders vectors: hash + detect + scripted DiscoveryContext scenarios.
+    use qd_engine::contract_builders as cb;
+    let mut hrows: Vec<String> = Vec::new();
+    for code in [None, Some(""), Some("  "), Some("x"), Some(" x "), Some("caf\u{00e9}")] {
+        hrows.push(format!(
+            "[{},{}]",
+            match code { Some(c) => jstr(c), None => "null".to_string() },
+            jstr(&cb::source_code_hash(code)),
+        ));
+    }
+    out += &format!("\"chash\":[{}],\n", hrows.join(","));
+    let mut vrows: Vec<String> = Vec::new();
+    for code in [
+        None,
+        Some("def initialize(context):\n context.set_universe(['A'])\n run_daily(f)"),
+        Some("def initialize(context):\n context.set_universe(['A'])"),
+        Some("def initialize(context):\n pass"),
+        Some("def initialize(context): context.set_universe(x)"),
+    ] {
+        vrows.push(format!(
+            "[{},{}]",
+            match code { Some(c) => jstr(c), None => "null".to_string() },
+            cb::is_strategy_v2_code(code),
+        ));
+    }
+    out += &format!("\"cdetect\":[{}],\n", vrows.join(","));
+
+    // parse_many probes: [input_json, keys_csv_or_ERR]
+    let pa = jh::JsonVal::Str("USStock:AAPL".into());
+    let pi = jh::JsonVal::Str("INDEX:HS300".into());
+    let pe = jh::JsonVal::Str("".into());
+    let pn = jh::JsonVal::Num("5".into());
+    let pinputs: Vec<cb::ManyInput> = vec![
+        cb::ManyInput::Null,
+        cb::ManyInput::Single(&pa),
+        cb::ManyInput::Single(&pi),
+        cb::ManyInput::Single(&pe),
+        cb::ManyInput::Single(&pn),
+    ];
+    let plist = vec![
+        jh::JsonVal::Str("USStock:AAPL".into()), jh::JsonVal::Str("MSFT".into()),
+        jh::JsonVal::Str("USStock:AAPL".into()), jh::JsonVal::Str("INDEX:HS300".into()),
+    ];
+    let pmap = vec![jh::JsonVal::Str("USStock:AAPL".into()), jh::JsonVal::Str("MSFT".into())];
+    let _ = (&plist, &pmap);
+    let mut prows: Vec<String> = Vec::new();
+    for (i, inp) in pinputs.iter().enumerate() {
+        let js = match i {
+            0 => "null".to_string(),
+            1 => jh::JsonVal::Str("USStock:AAPL".into()).dump(),
+            2 => jh::JsonVal::Str("INDEX:HS300".into()).dump(),
+            3 => jh::JsonVal::Str("".into()).dump(),
+            _ => jh::JsonVal::Num("5".into()).dump(),
+        };
+        prows.push(format!("[{},{}]", js, many_result(inp)));
+    }
+    prows.push(format!("[{},{}]", jh::JsonVal::Arr(plist.clone()).dump(), many_result(&cb::ManyInput::List(&plist))));
+    prows.push(format!("[{},{}]", jh::JsonVal::Obj(vec![("USStock:AAPL".to_string(), jh::JsonVal::Num("1".into())), ("MSFT".to_string(), jh::JsonVal::Num("2".into()))]).dump(), many_result(&cb::ManyInput::MapKeys(pmap.clone()))));
+    out += &format!("\"pmany\":[{}],\n", prows.join(","));
+
+    // scripted DiscoveryContext scenarios → state rows
+    out += &format!("\"cvec\":[{}]\n", contract_scenarios().join(","));
     out += "}\n";
     print!("{out}");
+}
+
+fn many_result(inp: &qd_engine::contract_builders::ManyInput) -> String {
+    match qd_engine::contract_builders::parse_many(inp) {
+        Ok(items) => jstr(&items.iter().map(|i| i.key()).collect::<Vec<_>>().join(",")),
+        Err(e) => jstr(&format!("ERR:{}", err_str(&e))),
+    }
+}
+
+fn err_str(e: &qd_engine::contract_builders::BuilderError) -> String {
+    match e {
+        qd_engine::contract_builders::BuilderError::Contract(c) => format!("C:{c}"),
+        qd_engine::contract_builders::BuilderError::Value(_) => "V".to_string(),
+        qd_engine::contract_builders::BuilderError::Type(m) => format!("T:{m}"),
+    }
+}
+
+fn ctx_state(ctx: &qd_engine::contract_builders::DiscoveryContext) -> String {
+    use qd_engine::json_helpers::JsonVal;
+    let subs = ctx
+        .subscriptions
+        .iter()
+        .map(|s| {
+            format!(
+                "{}|{}|{}|{}",
+                s.frequency,
+                s.fields.join(","),
+                s.universe_reference,
+                s.instruments.iter().map(|i| i.key()).collect::<Vec<_>>().join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let scheds = ctx
+        .schedules
+        .iter()
+        .map(|s| {
+            format!(
+                "{}|{}|{}|{}|{}",
+                s.frequency,
+                s.callback,
+                s.time,
+                s.weekday.map(|w| w.to_string()).unwrap_or_default(),
+                s.monthday.map(|m| m.to_string()).unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let maxlev = if ctx.max_leverage.is_nan() {
+        "nan".to_string()
+    } else {
+        format!("{:?}", ctx.max_leverage)
+    };
+    format!(
+        "[{},{},{},{},{},{},{},{},{}]",
+        jstr(&ctx.universe_reference),
+        jstr(&ctx.instruments.iter().map(|i| i.key()).collect::<Vec<_>>().join(",")),
+        jstr(&subs),
+        jstr(&scheds),
+        match &ctx.benchmark {
+            Some(b) => jstr(&b.key()),
+            None => "null".to_string(),
+        },
+        ctx.warmup_bars,
+        ctx.leverage_allowed,
+        jstr(&maxlev),
+        JsonVal::Obj(ctx.metadata.clone()).dump(),
+    )
+}
+
+fn contract_scenarios() -> Vec<String> {
+    use qd_engine::contract_builders as cb;
+    use qd_engine::contract_builders::CallbackArg;
+    use qd_engine::json_helpers::JsonVal;
+    let s = |v: &str| JsonVal::Str(v.to_string());
+    let num = |v: &str| JsonVal::Num(v.to_string());
+    let null = JsonVal::Null;
+    let anon = CallbackArg::Callable { name: None };
+    let kw_cb = CallbackArg::Callable { name: Some("kw_cb") };
+    let one = num("1");
+    let notcb = CallbackArg::Value(&one);
+
+    // Each scenario: name + ops. Values borrowed from locals above via closure-free code.
+    let mut rows: Vec<String> = Vec::new();
+    // Op enum local to this fn.
+    enum Op<'a> {
+        U { values: Option<JsonVal>, index: Option<JsonVal>, pool: Option<JsonVal> },
+        B { value: JsonVal },
+        S { symbols: Option<Vec<JsonVal>>, freq: JsonVal, fields: Option<Vec<JsonVal>> },
+        W { bars: JsonVal },
+        L { max: JsonVal },
+        M { args: Vec<JsonVal>, kwargs: Vec<(String, JsonVal)> },
+        Daily { pos: Vec<CallbackArg<'a>>, kw_cb: Option<CallbackArg<'a>>, time: JsonVal },
+        Weekly { pos: Vec<CallbackArg<'a>>, kwargs: Vec<(String, JsonVal)>, kw_cb: Option<CallbackArg<'a>> },
+        Monthly { pos: Vec<CallbackArg<'a>>, kwargs: Vec<(String, JsonVal)>, kw_cb: Option<CallbackArg<'a>> },
+    }
+    // NOTE: scenarios borrow from s/num/null/on_open/... — build per-scenario inline.
+    let run = |name: &str, ops: Vec<Op>| -> String {
+        let mut ctx = cb::DiscoveryContext::new();
+        for op in &ops {
+            let r = match op {
+                Op::U { values, index, pool } => ctx.set_universe(values.as_ref(), index.as_ref(), pool.as_ref()),
+                Op::B { value } => ctx.set_benchmark(value),
+                Op::S { symbols, freq, fields } => {
+                    ctx.subscribe(symbols.as_deref(), freq, fields.as_deref())
+                }
+                Op::W { bars } => ctx.set_warmup(bars),
+                Op::L { max } => ctx.allow_leverage(max),
+                Op::M { args, kwargs } => ctx.set_metadata(args, kwargs),
+                Op::Daily { pos, kw_cb, time } => ctx.schedule_daily(pos, kw_cb.as_ref(), time),
+                Op::Weekly { pos, kwargs, kw_cb } => ctx.schedule_weekly(pos, kwargs, kw_cb.as_ref()),
+                Op::Monthly { pos, kwargs, kw_cb } => ctx.schedule_monthly(pos, kwargs, kw_cb.as_ref()),
+            };
+            if let Err(e) = r {
+                return format!("[{},{}]", jstr(name), jstr(&format!("ERR:{}", err_str(&e))));
+            }
+        }
+        format!("[{},{}]", jstr(name), ctx_state(&ctx))
+    };
+    rows.push(run("u_pool", vec![Op::U { values: None, index: None, pool: Some(s("my-pool")) }]));
+    rows.push(run(
+        "u_list",
+        vec![Op::U {
+            values: Some(JsonVal::Arr(vec![s("USStock:AAPL"), s("USStock:AAPL"), s("INDEX:HS300")])),
+            index: None,
+            pool: None,
+        }],
+    ));
+    rows.push(run("u_str", vec![Op::U { values: Some(s("BTCUSDT")), index: None, pool: None }]));
+    rows.push(run("u_absent", vec![Op::U { values: None, index: None, pool: None }]));
+    rows.push(run("u_pool_empty", vec![Op::U { values: None, index: None, pool: Some(s("")) }]));
+    rows.push(run("u_pool_null", vec![Op::U { values: None, index: None, pool: Some(null.clone()) }]));
+    rows.push(run("u_index", vec![Op::U { values: None, index: Some(s("INDEX:HS300")), pool: None }]));
+    rows.push(run("u_dict", vec![Op::U {
+        values: Some(JsonVal::Obj(vec![(String::from("USStock:AAPL"), num("1")), (String::from("MSFT"), num("2"))])),
+        index: None, pool: None,
+    }]));
+    rows.push(run("u_badsym", vec![Op::U { values: Some(s("!!!")), index: None, pool: None }]));
+    rows.push(run("bench", vec![Op::B { value: s("MSFT") }]));
+    rows.push(run("bench_bad", vec![Op::B { value: s("") }]));
+    rows.push(run(
+        "sub_defaults",
+        vec![
+            Op::U { values: Some(JsonVal::Arr(vec![s("USStock:AAPL")])), index: None, pool: None },
+            Op::S { symbols: None, freq: null.clone(), fields: None },
+        ],
+    ));
+    rows.push(run(
+        "sub_custom",
+        vec![Op::S {
+            symbols: Some(vec![s("600519.XSHG")]),
+            freq: s("1H"),
+            fields: Some(vec![s("Close"), s(" VOL ")]),
+        }],
+    ));
+    rows.push(run("sub_nouniv", vec![Op::S { symbols: None, freq: s("1d"), fields: None }]));
+    rows.push(run("warmup_seq", vec![Op::W { bars: s("20") }, Op::W { bars: s("-5") }, Op::W { bars: null.clone() }]));
+    rows.push(run("warmup_bad", vec![Op::W { bars: s("x") }]));
+    rows.push(run(
+        "lev_seq",
+        vec![Op::L { max: s("3") }, Op::L { max: s("0.5") }, Op::L { max: null.clone() }],
+    ));
+    rows.push(run("lev_bad", vec![Op::L { max: s("x") }]));
+    rows.push(run(
+        "meta_seq",
+        vec![Op::M {
+            args: vec![JsonVal::Obj(vec![(String::from("a"), s("1"))])],
+            kwargs: vec![(String::from("b"), s("2"))],
+        }, Op::M { args: vec![s("k"), s("v")], kwargs: vec![] }],
+    ));
+    rows.push(run("meta_1arg", vec![Op::M { args: vec![s("only")], kwargs: vec![] }]));
+    rows.push(run("meta_3args", vec![Op::M { args: vec![s("a"), s("b"), s("c")], kwargs: vec![] }]));
+    rows.push(run(
+        "sched_daily",
+        vec![Op::Daily { pos: vec![CallbackArg::Callable { name: Some("on_open") }], kw_cb: None, time: s("09:30") }],
+    ));
+    rows.push(run(
+        "sched_pos_beats_kw",
+        vec![Op::Weekly {
+            pos: vec![anon],
+            kwargs: vec![(String::from("weekday"), s("3"))],
+            kw_cb: Some(kw_cb),
+        }],
+    ));
+    rows.push(run(
+        "sched_nocb",
+        vec![Op::Monthly { pos: vec![notcb], kwargs: vec![], kw_cb: None }],
+    ));
+    rows.push(run("sched_monthly_def", vec![Op::Monthly { pos: vec![CallbackArg::Callable { name: Some("on_open") }], kwargs: vec![], kw_cb: None }]));
+    rows.push(run(
+        "full",
+        vec![
+            Op::U { values: Some(JsonVal::Arr(vec![s("USStock:AAPL")])), index: None, pool: None },
+            Op::S { symbols: None, freq: null.clone(), fields: None },
+            Op::W { bars: s("50") },
+            Op::L { max: num("2") },
+            Op::M { args: vec![], kwargs: vec![(String::from("frequency"), s("1d"))] },
+            Op::Daily { pos: vec![CallbackArg::Callable { name: Some("on_open") }], kw_cb: None, time: s("09:30") },
+        ],
+    ));
+    let _ = s;
+    rows
 }

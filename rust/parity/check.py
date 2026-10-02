@@ -1009,6 +1009,110 @@ def main() -> int:
     check("brokers.msg", vec["brokers"][len(_lvals)],
           _lb.desktop_broker_cloud_reject_message())
 
+    # --- market_data_errors: classify through the real module ---
+    _stub("app.data_sources")
+    _mde = _load("app.data_sources.errors", "app/data_sources/errors.py")
+    _cerrs = [
+        "451 restricted location",
+        "ProxyError: tunnel connection failed",
+        "symbol not found on market",
+        "429 too many requests",
+        "incomplete kline coverage",
+        "connection refused by peer",
+        "timeframe unsupported here",
+        "weird thing",
+        "",
+        "451 proxyerror tunnel",
+        "get https://user:pass@api.x.com/a and HTTP://a:b@h.io/b failed: timeout",
+        "https://host/path no creds",
+        "https://u@host/",
+        "caf\u00e9 timeout \u2603",
+    ]
+    assert len(vec["cerr"]) == len(_cerrs), len(vec["cerr"])
+    for i, e in enumerate(_cerrs):
+        f = _mde.classify_market_data_failure(e, exchange_id=" Binance ",
+                                              market_type="SPOT", symbol="BTC/USDT",
+                                              timeframe="1h")
+        d = f.as_dict()
+        check(f"cerr[{i}]", vec["cerr"][i],
+              [d["code"], d["message"], d["technical_detail"], d["retryable"],
+               d["exchange_id"], d["market_type"], d["symbol"], d["timeframe"]])
+    # from_mapping through the real dataclass
+    _mmap = [
+        (None, None, "", None),
+        ("rate_limited", "M", "d", True),
+        ("", "", "", False),
+        ("x", "y", "\u00e9" * 600, 0),
+        (None, None, "", 1),
+        (None, None, "", ""),
+        (None, None, "", "x"),
+        (None, None, "", []),
+        (None, None, "", {}),
+    ]
+    assert len(vec["cmap"]) == len(_mmap), len(vec["cmap"])
+    for i, (c, m, d, r) in enumerate(_mmap):
+        fields = {"technical_detail": d}
+        if c is not None:
+            fields["code"] = c
+        if m is not None:
+            fields["message"] = m
+        if r is not None:
+            fields["retryable"] = r
+        f = _mde.MarketDataFailure.from_mapping(fields)
+        check(f"cmap[{i}]", vec["cmap"][i], [f.code, f.message, f.technical_detail, f.retryable])
+
+    # --- strategy_runtime_logs: stub db/logger, load real module ---
+    import logging as _logging  # noqa: E402
+    _db_stub = _stub("app.utils.db")
+    _db_stub.get_db_connection = lambda: (_ for _ in ()).throw(RuntimeError("no db in parity"))
+    _log_stub = _stub("app.utils.logger")
+    _log_stub.get_logger = _logging.getLogger
+    _srl = _load("app.utils.strategy_runtime_logs", "app/utils/strategy_runtime_logs.py")
+    check("cfmt.len", len(vec["cfmt"]), 3)
+    for i, e in enumerate(["connection refused by peer", "caf\u00e9 timeout \u2603", ""]):
+        f = _mde.classify_market_data_failure(e, exchange_id="binance",
+                                              market_type="spot", symbol="BTC",
+                                              timeframe="1h")
+        check(f"cfmt[{i}]", vec["cfmt"][i], _srl.format_market_data_log(f))
+    # parse probes: compare decoded dicts (None for rejects)
+    _parse_in = [
+        _srl.format_market_data_log(_mde.classify_market_data_failure(
+            "timeout", exchange_id="binance", market_type="spot",
+            symbol="BTC", timeframe="1h")),
+        "plain line",
+        "market-data|[1,2]",
+        "market-data|{bad",
+        "market-data|",
+        "market-data|5",
+        'market-data|  {"k" : 1 }  ',
+    ]
+    assert len(vec["cparse"]) == len(_parse_in), len(vec["cparse"])
+    for i, line in enumerate(_parse_in):
+        check(f"cparse[{i}]", vec["cparse"][i], [line, _srl.parse_market_data_log(line)])
+    # normalize probes = append_strategy_log minus DB: replicate pure prelude
+    def _py_norm(sid, ok, lv, mg):
+        if not ok:
+            return None
+        l = (lv or "info").strip().lower()[:20]
+        m = (mg or "").strip()
+        if not m:
+            return None
+        return [sid, l, m[:8000]]
+    _norm_in = [
+        (7, True, " WARNING ", "  hi  "),
+        (7, True, None, "m"),
+        (7, False, None, "m"),
+        (7, True, None, "   "),
+        (7, True, None, None),
+        (1, True, "x" * 40, "m"),
+        (1, True, None, "y" * 9000),
+        (1, True, None, "\U0001F600" * 9000),
+        (1, True, "\u00e9X " * 10, "m"),
+    ]
+    assert len(vec["cnorm"]) == len(_norm_in), len(vec["cnorm"])
+    for i, (sid, ok, lv, mg) in enumerate(_norm_in):
+        check(f"cnorm[{i}]", vec["cnorm"][i], _py_norm(sid, ok, lv, mg))
+
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")
         return 1

@@ -58,6 +58,8 @@ pub mod notification_display;
 /// IBKR desktop-broker deployment policy (`utils/local_brokers.py`).
 pub mod local_brokers;
 pub mod manifest;
+/// Market-data failure taxonomy (`data_sources/errors.py`, pure slice).
+pub mod market_data_errors;
 pub mod market_visibility;
 pub mod net_pnl;
 pub mod perf_metrics;
@@ -67,4 +69,6 @@ pub mod protection;
 pub mod readiness;
 pub mod risk_guard;
 pub mod snapshot;
+/// Strategy runtime log lines (`utils/strategy_runtime_logs.py`, DB-free slice).
+pub mod strategy_runtime_logs;
 pub mod timeutil;

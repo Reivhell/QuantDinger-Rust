@@ -1219,7 +1219,133 @@ fn main() {
     }
     // exact reject message, JSON-escaped
     lres.push(jstr(lb::CLOUD_REJECT_MESSAGE));
-    out += &format!("\"brokers\":[{}]\n", lres.join(","));
+    out += &format!("\"brokers\":[{}],\n", lres.join(","));
+
+    // market_data_errors + strategy_runtime_logs vectors.
+    use qd_engine::market_data_errors as mde;
+    use qd_engine::strategy_runtime_logs as srl;
+    let cerrs: &[&str] = &[
+        "451 restricted location",
+        "ProxyError: tunnel connection failed",
+        "symbol not found on market",
+        "429 too many requests",
+        "incomplete kline coverage",
+        "connection refused by peer",
+        "timeframe unsupported here",
+        "weird thing",
+        "",
+        "451 proxyerror tunnel",
+        "get https://user:pass@api.x.com/a and HTTP://a:b@h.io/b failed: timeout",
+        "https://host/path no creds",
+        "https://u@host/",
+        "caf\u{00e9} timeout \u{2603}",
+    ];
+    let mut ce: Vec<String> = Vec::new();
+    for e in cerrs {
+        let f = mde::classify_market_data_failure(e, " Binance ", "SPOT", "BTC/USDT", "1h");
+        ce.push(format!(
+            "[{},{},{},{},{},{},{},{}]",
+            jstr(&f.code),
+            jstr(&f.message),
+            jstr(&f.technical_detail),
+            f.retryable,
+            jstr(&f.exchange_id),
+            jstr(&f.market_type),
+            jstr(&f.symbol),
+            jstr(&f.timeframe)
+        ));
+    }
+    out += &format!("\"cerr\":[{}],\n", ce.join(","));
+
+    // from_mapping probes: (code_opt, msg_opt, detail, retryable_json_or_null)
+    let mmap: Vec<(Option<&str>, Option<&str>, String, String)> = vec![
+        (None, None, "".to_string(), "null".to_string()),
+        (Some("rate_limited"), Some("M"), "d".to_string(), "true".to_string()),
+        (Some(""), Some(""), "".to_string(), "false".to_string()),
+        (Some("x"), Some("y"), "\u{00e9}".repeat(600), "0".to_string()),
+        (None, None, "".to_string(), "1".to_string()),
+        (None, None, "".to_string(), "\"\"".to_string()),
+        (None, None, "".to_string(), "\"x\"".to_string()),
+        (None, None, "".to_string(), "[]".to_string()),
+        (None, None, "".to_string(), "{}".to_string()),
+    ];
+    let mut cm: Vec<String> = Vec::new();
+    for (c, m, d, r) in &mmap {
+        let mut fields: Vec<(String, jh::JsonVal)> = vec![(
+            "technical_detail".to_string(),
+            jh::JsonVal::Str(d.clone()),
+        )];
+        if let Some(s) = c {
+            fields.push(("code".to_string(), jh::JsonVal::Str(s.to_string())));
+        }
+        if let Some(s) = m {
+            fields.push(("message".to_string(), jh::JsonVal::Str(s.to_string())));
+        }
+        if r != "null" {
+            let rv = jh::parse_json(r).unwrap();
+            fields.push(("retryable".to_string(), rv));
+        }
+        let f = mde::MarketDataFailure::from_mapping(&fields);
+        cm.push(format!(
+            "[{},{},{},{}]",
+            jstr(&f.code),
+            jstr(&f.message),
+            jstr(&f.technical_detail),
+            f.retryable
+        ));
+    }
+    out += &format!("\"cmap\":[{}],\n", cm.join(","));
+
+    // format probes: exact lines for 3 representative failures.
+    let mut cf: Vec<String> = Vec::new();
+    for e in ["connection refused by peer", "caf\u{00e9} timeout \u{2603}", ""] {
+        let f = mde::classify_market_data_failure(e, "binance", "spot", "BTC", "1h");
+        cf.push(jstr(&srl::format_market_data_log(&f)));
+    }
+    out += &format!("\"cfmt\":[{}],\n", cf.join(","));
+
+    // parse probes: valid line + rejects.
+    let good_line = srl::format_market_data_log(&mde::classify_market_data_failure(
+        "timeout", "binance", "spot", "BTC", "1h",
+    ));
+    let parse_cases: Vec<String> = vec![
+        good_line,
+        "plain line".to_string(),
+        "market-data|[1,2]".to_string(),
+        "market-data|{bad".to_string(),
+        "market-data|".to_string(),
+        "market-data|5".to_string(),
+        "market-data|  {\"k\" : 1 }  ".to_string(),
+    ];
+    let mut cp: Vec<String> = Vec::new();
+    for line in &parse_cases {
+        match srl::parse_market_data_log(line) {
+            Some(kv) => cp.push(format!("[{},{}]", jstr(line), jh::JsonVal::Obj(kv).dump())),
+            None => cp.push(format!("[{},null]", jstr(line))),
+        }
+    }
+    out += &format!("\"cparse\":[{}],\n", cp.join(","));
+
+    // normalize probes: (sid, coerce_ok, level_opt, msg_opt) → row or null.
+    let norm_cases: Vec<(i64, bool, Option<String>, Option<String>)> = vec![
+        (7, true, Some(" WARNING ".to_string()), Some("  hi  ".to_string())),
+        (7, true, None, Some("m".to_string())),
+        (7, false, None, Some("m".to_string())),
+        (7, true, None, Some("   ".to_string())),
+        (7, true, None, None),
+        (1, true, Some("x".repeat(40)), Some("m".to_string())),
+        (1, true, None, Some("y".repeat(9000))),
+        (1, true, None, Some("\u{1f600}".repeat(9000))),
+        (1, true, Some("\u{00e9}X ".repeat(10)), Some("m".to_string())),
+    ];
+    let mut cn: Vec<String> = Vec::new();
+    for (sid, ok, lv, mg) in &norm_cases {
+        match srl::normalize_log_row(*sid, *ok, lv.as_deref(), mg.as_deref()) {
+            Some((s, l, m)) => cn.push(format!("[{},{},{}]", s, jstr(&l), jstr(&m))),
+            None => cn.push("null".to_string()),
+        }
+    }
+    out += &format!("\"cnorm\":[{}]\n", cn.join(","));
     out += "}\n";
     print!("{out}");
 }

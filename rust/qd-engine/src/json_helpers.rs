@@ -34,19 +34,29 @@ impl JsonVal {
 
     /// Emit canonical JSON (`ensure_ascii=True`, compact separators).
     pub fn dump(&self) -> String {
+        self.dump_inner(false)
+    }
+
+    /// Emit compact JSON with raw UTF-8 passthrough (`ensure_ascii=False`),
+    /// matching `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`.
+    pub fn dump_raw(&self) -> String {
+        self.dump_inner(true)
+    }
+
+    fn dump_inner(&self, raw_utf8: bool) -> String {
         match self {
             JsonVal::Null => "null".to_string(),
             JsonVal::Bool(true) => "true".to_string(),
             JsonVal::Bool(false) => "false".to_string(),
             JsonVal::Num(raw) => raw.clone(),
-            JsonVal::Str(s) => dump_str(s),
+            JsonVal::Str(s) => dump_str_inner(s, raw_utf8),
             JsonVal::Arr(xs) => {
-                format!("[{}]", xs.iter().map(|x| x.dump()).collect::<Vec<_>>().join(","))
+                format!("[{}]", xs.iter().map(|x| x.dump_inner(raw_utf8)).collect::<Vec<_>>().join(","))
             }
             JsonVal::Obj(kv) => format!(
                 "{{{}}}",
                 kv.iter()
-                    .map(|(k, v)| format!("{}:{}", dump_str(k), v.dump()))
+                    .map(|(k, v)| format!("{}:{}", dump_str_inner(k, raw_utf8), v.dump_inner(raw_utf8)))
                     .collect::<Vec<_>>()
                     .join(",")
             ),
@@ -55,6 +65,10 @@ impl JsonVal {
 }
 
 fn dump_str(s: &str) -> String {
+    dump_str_inner(s, false)
+}
+
+fn dump_str_inner(s: &str, raw_utf8: bool) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -67,7 +81,7 @@ fn dump_str(s: &str) -> String {
             '\u{08}' => out.push_str("\\b"),
             '\u{0C}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c if (c as u32) > 0x7F => {
+            c if (c as u32) > 0x7F && !raw_utf8 => {
                 let mut buf = [0u16; 2];
                 for u in c.encode_utf16(&mut buf) {
                     out.push_str(&format!("\\u{u:04x}"));

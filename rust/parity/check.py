@@ -1113,6 +1113,28 @@ def main() -> int:
     for i, (sid, ok, lv, mg) in enumerate(_norm_in):
         check(f"cnorm[{i}]", vec["cnorm"][i], _py_norm(sid, ok, lv, mg))
 
+    # --- thread_capacity: same cgroup files through the real module ---
+    import re as _re  # noqa: E402
+    _tc = _load("app.utils.thread_capacity", "app/utils/thread_capacity.py")
+    _py_snap = _tc.thread_capacity_snapshot()
+    assert len(vec["tcap"]) == 5, len(vec["tcap"])
+    assert isinstance(vec["tcap"][0], int) and vec["tcap"][0] >= 1, vec["tcap"][0]
+    assert isinstance(_py_snap["python_threads"], int) and _py_snap["python_threads"] >= 1
+    for i, k in enumerate(["pids_current", "pids_max", "memory_current", "memory_max"]):
+        rust_v, py_v = vec["tcap"][1 + i], _py_snap[k]
+        if py_v is None:
+            check(f"tcap.{k}", rust_v, "none")
+        else:
+            # cgroup-wide counters: stable limits exact, live counters shape-checked
+            if k.endswith("_max"):
+                check(f"tcap.{k}", rust_v, f"v:{py_v}")
+            else:
+                check(f"tcap.{k}.present", rust_v.startswith("v:"), True)
+                check(f"tcap.{k}.numeric", bool(_re.fullmatch(r"v:\d+", rust_v)), True)
+                check(f"tcap.{k}.pynumeric", str(py_v).isdigit(), True)
+    _norm = lambda s: _re.sub(r"python_threads=\d+", "python_threads=N", s)
+    check("tcap_fmt", _norm(vec["tcap_fmt"]), _norm(_tc.format_thread_capacity()))
+
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")
         return 1

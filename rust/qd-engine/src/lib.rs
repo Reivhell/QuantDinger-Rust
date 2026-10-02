@@ -71,4 +71,6 @@ pub mod risk_guard;
 pub mod snapshot;
 /// Strategy runtime log lines (`utils/strategy_runtime_logs.py`, DB-free slice).
 pub mod strategy_runtime_logs;
+/// Process/thread capacity diagnostics (`utils/thread_capacity.py`).
+pub mod thread_capacity;
 pub mod timeutil;

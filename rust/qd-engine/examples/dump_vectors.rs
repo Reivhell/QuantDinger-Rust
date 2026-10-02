@@ -1345,7 +1345,24 @@ fn main() {
             None => cn.push("null".to_string()),
         }
     }
-    out += &format!("\"cnorm\":[{}]\n", cn.join(","));
+    out += &format!("\"cnorm\":[{}],\n", cn.join(","));
+
+    // thread_capacity vectors: live snapshot + its formatted line.
+    use qd_engine::thread_capacity as tc;
+    let snap = tc::snapshot();
+    let optv = |o: &Option<String>| match o {
+        Some(s) => format!("\"v:{s}\""),
+        None => "\"none\"".to_string(),
+    };
+    out += &format!(
+        "\"tcap\":[{},{},{},{},{}],\n",
+        snap.threads,
+        optv(&snap.pids_current),
+        optv(&snap.pids_max),
+        optv(&snap.memory_current),
+        optv(&snap.memory_max)
+    );
+    out += &format!("\"tcap_fmt\":{}\n", jstr(&tc::format_capacity(&snap)));
     out += "}\n";
     print!("{out}");
 }

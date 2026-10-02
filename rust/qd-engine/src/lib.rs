@@ -44,6 +44,8 @@
 //!   frequencies, driving frequency, metadata shapes)
 
 pub mod close_reason;
+/// Credential crypto (`utils/credential_crypto.py`, pure crypto core).
+pub mod credential_crypto;
 pub mod curve_sampling;
 pub mod data_portal;
 pub mod frequencies;

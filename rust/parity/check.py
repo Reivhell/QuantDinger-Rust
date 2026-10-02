@@ -1135,6 +1135,259 @@ def main() -> int:
     _norm = lambda s: _re.sub(r"python_threads=\d+", "python_threads=N", s)
     check("tcap_fmt", _norm(vec["tcap_fmt"]), _norm(_tc.format_thread_capacity()))
 
+    # --- credential_crypto: cross-implementation Fernet vectors ---
+    import base64 as _b64  # noqa: E402
+    import hashlib as _hl  # noqa: E402
+    import hmac as _hmac  # noqa: E402
+    import os as _os2  # noqa: E402
+    import time as _time  # noqa: E402
+
+    # Pure-Python Fernet stand-in for the `cryptography` package (unavailable
+    # offline). SBOX is *derived* via GF(2^8) math, and both AES directions are
+    # anchored to the FIPS-197 Appendix B vector below — not to the Rust code.
+    def _gf_mul(a: int, b: int) -> int:
+        p = 0
+        for _ in range(8):
+            if b & 1:
+                p ^= a
+            hi = a & 0x80
+            a = (a << 1) & 0xFF
+            if hi:
+                a ^= 0x1B
+            b >>= 1
+        return p
+
+    def _gf_pow(a: int, e: int) -> int:
+        r = 1
+        while e:
+            if e & 1:
+                r = _gf_mul(r, a)
+            a = _gf_mul(a, a)
+            e >>= 1
+        return r
+
+    def _rot(b: int, n: int) -> int:
+        return ((b << n) | (b >> (8 - n))) & 0xFF
+
+    _SBOX = []
+    for _i in range(256):
+        _inv = _gf_pow(_i, 254) if _i else 0
+        _SBOX.append(_inv ^ _rot(_inv, 1) ^ _rot(_inv, 2) ^ _rot(_inv, 3) ^ _rot(_inv, 4) ^ 0x63)
+    _INV_SBOX = [0] * 256
+    for _i, _s in enumerate(_SBOX):
+        _INV_SBOX[_s] = _i
+    _RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36]
+
+    def _expand(_key: bytes):
+        _rk = [bytearray(_key)]
+        for _i in range(1, 11):
+            _t = bytearray(_SBOX[b] for b in (_rk[-1][13], _rk[-1][14], _rk[-1][15], _rk[-1][12]))
+            _t[0] ^= _RCON[_i - 1]
+            _n = bytearray(16)
+            for _j in range(4):
+                _n[_j] = _rk[-1][_j] ^ _t[_j]
+            for _j in range(4, 16):
+                _n[_j] = _rk[-1][_j] ^ _n[_j - 4]
+            _rk.append(_n)
+        return _rk
+
+    # (full block encrypt built explicitly to keep shift/mix readable)
+    def _shift(_s: bytearray) -> bytearray:
+        return bytearray([_s[0], _s[5], _s[10], _s[15], _s[4], _s[9], _s[14], _s[3],
+                          _s[8], _s[13], _s[2], _s[7], _s[12], _s[1], _s[6], _s[11]])
+
+    def _inv_shift(_s: bytearray) -> bytearray:
+        return bytearray([_s[0], _s[13], _s[10], _s[7], _s[4], _s[1], _s[14], _s[11],
+                          _s[8], _s[5], _s[2], _s[15], _s[12], _s[9], _s[6], _s[3]])
+
+    def _mix(_s: bytearray) -> bytearray:
+        def _xt(_x):
+            return ((_x << 1) & 0xFF) ^ (0x1B if _x & 0x80 else 0)
+        _o = bytearray(16)
+        for _c in range(4):
+            _a0, _a1, _a2, _a3 = _s[4*_c:4*_c+4]
+            _o[4*_c] = _xt(_a0) ^ (_xt(_a1) ^ _a1) ^ _a2 ^ _a3
+            _o[4*_c+1] = _a0 ^ _xt(_a1) ^ (_xt(_a2) ^ _a2) ^ _a3
+            _o[4*_c+2] = _a0 ^ _a1 ^ _xt(_a2) ^ (_xt(_a3) ^ _a3)
+            _o[4*_c+3] = (_xt(_a0) ^ _a0) ^ _a1 ^ _a2 ^ _xt(_a3)
+        return _o
+
+    def _inv_mix(_s: bytearray) -> bytearray:
+        _o = bytearray(16)
+        for _c in range(4):
+            _a0, _a1, _a2, _a3 = _s[4*_c:4*_c+4]
+            _o[4*_c] = _gf_mul(_a0, 0x0E) ^ _gf_mul(_a1, 0x0B) ^ _gf_mul(_a2, 0x0D) ^ _gf_mul(_a3, 0x09)
+            _o[4*_c+1] = _gf_mul(_a0, 0x09) ^ _gf_mul(_a1, 0x0E) ^ _gf_mul(_a2, 0x0B) ^ _gf_mul(_a3, 0x0D)
+            _o[4*_c+2] = _gf_mul(_a0, 0x0D) ^ _gf_mul(_a1, 0x09) ^ _gf_mul(_a2, 0x0E) ^ _gf_mul(_a3, 0x0B)
+            _o[4*_c+3] = _gf_mul(_a0, 0x0B) ^ _gf_mul(_a1, 0x0D) ^ _gf_mul(_a2, 0x09) ^ _gf_mul(_a3, 0x0E)
+        return _o
+
+    def _block_enc(_key: bytes, _blk: bytes) -> bytes:
+        _rk, _s = _expand(_key), bytearray(_blk)
+        for _i in range(16):
+            _s[_i] ^= _rk[0][_i]
+        for _r in range(1, 10):
+            _s = bytearray(_SBOX[b] for b in _s)
+            _s = _shift(_s)
+            _s = _mix(_s)
+            for _i in range(16):
+                _s[_i] ^= _rk[_r][_i]
+        _s = bytearray(_SBOX[b] for b in _s)
+        _s = _shift(_s)
+        for _i in range(16):
+            _s[_i] ^= _rk[10][_i]
+        return bytes(_s)
+
+    def _block_dec(_key: bytes, _blk: bytes) -> bytes:
+        _rk, _s = _expand(_key), bytearray(_blk)
+        for _i in range(16):
+            _s[_i] ^= _rk[10][_i]
+        for _r in range(9, 0, -1):
+            _s = _inv_shift(_s)
+            _s = bytearray(_INV_SBOX[b] for b in _s)
+            for _i in range(16):
+                _s[_i] ^= _rk[_r][_i]
+            _s = _inv_mix(_s)
+        _s = _inv_shift(_s)
+        _s = bytearray(_INV_SBOX[b] for b in _s)
+        for _i in range(16):
+            _s[_i] ^= _rk[0][_i]
+        return bytes(_s)
+
+    # Anchor the oracle to FIPS-197 Appendix B before trusting it.
+    assert _block_enc(bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c"),
+                      bytes.fromhex("3243f6a8885a308d313198a2e0370734")).hex() == \
+        "3925841d02dc09fbdc118597196a0b32", "oracle AES self-check failed"
+    assert _block_dec(bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c"),
+                      bytes.fromhex("3925841d02dc09fbdc118597196a0b32")).hex() == \
+        "3243f6a8885a308d313198a2e0370734", "oracle AES self-check failed"
+
+    class _StubInvalidToken(Exception):
+        pass
+
+    class _StubFernet:
+        def __init__(self, key):
+            raw = _b64.urlsafe_b64decode(key)
+            self._sign, self._enc = raw[:16], raw[16:]
+
+        def encrypt(self, data: bytes) -> bytes:
+            iv = _os2.urandom(16)
+            pad = 16 - len(data) % 16
+            pt = data + bytes([pad]) * pad
+            prev, ct = iv, b""
+            for i in range(0, len(pt), 16):
+                blk = bytes(a ^ b for a, b in zip(pt[i:i+16], prev))
+                blk = _block_enc(self._enc, blk)
+                ct += blk
+                prev = blk
+            body = b"\x80" + int(_time.time()).to_bytes(8, "big") + iv + ct
+            return _b64.urlsafe_b64encode(body + _hmac.new(self._sign, body, _hl.sha256).digest())
+
+        def decrypt(self, token) -> bytes:
+            try:
+                data = _b64.urlsafe_b64decode(token)
+            except Exception:
+                raise _StubInvalidToken
+            if len(data) < 57 or data[0] != 0x80:
+                raise _StubInvalidToken
+            if not _hmac.compare_digest(
+                    _hmac.new(self._sign, data[:-32], _hl.sha256).digest(), data[-32:]):
+                raise _StubInvalidToken
+            prev, pt = data[9:25], b""
+            for i in range(25, len(data) - 32, 16):
+                dec = _block_dec(self._enc, data[i:i+16])
+                pt += bytes(a ^ b for a, b in zip(dec, prev))
+                prev = data[i:i+16]
+            pad = pt[-1]
+            if pad < 1 or pad > 16 or pt[-pad:] != bytes([pad]) * pad:
+                raise _StubInvalidToken
+            return pt[:-pad]
+
+    _fernet_pkg = types.ModuleType("cryptography")
+    _fernet_sub = types.ModuleType("cryptography.fernet")
+    _fernet_sub.Fernet, _fernet_sub.InvalidToken = _StubFernet, _StubInvalidToken
+    sys.modules["cryptography"], sys.modules["cryptography.fernet"] = _fernet_pkg, _fernet_sub
+    _cc = _load("app.utils.credential_crypto", "app/utils/credential_crypto.py")
+    _PyFernet = _StubFernet
+    _CSEC = "qd-parity-secret"
+    _CPLAIN = ["", '{"api_key":"ABC123"}', "caf\u00e9 \U0001F600", "x"]
+    assert len(vec["cenc"]) == len(_CPLAIN) + 1, len(vec["cenc"])
+    if True:  # stub oracle always available (cryptography missing offline)
+        _pyf = _PyFernet(_b64.urlsafe_b64encode(_hl.sha256(_CSEC.encode()).digest()))
+        # Rust-encrypted → Python decrypts (incl. deterministic fixed vector)
+        for i, tok in enumerate(vec["cenc"]):
+            want = _CPLAIN[i] if i < len(_CPLAIN) else "fixed-vector"
+            check(f"cenc[{i}].pydec", _pyf.decrypt(tok.encode()).decode(), want)
+        # Python-encrypted → Rust decrypt_probe decrypts
+        _py_toks = [
+            _pyf.encrypt(p.encode()).decode() for p in (["hello", ""] + _CPLAIN)
+        ]
+        _py_toks += [
+            _pyf.encrypt(b"legacy").decode(),  # for key-fallback ordering
+            _py_toks[0][:-4] + "AAAA",  # tampered → InvalidToken both sides
+            "not-a-token!!",
+            "",
+            "caf\u00e9-token",
+        ]
+        _probe = subprocess.run(
+            ["cargo", "run", "--quiet", "--example", "decrypt_probe", "--",
+             _CSEC, *_py_toks],
+            cwd=RUST, capture_output=True, text=True,
+        )
+        assert _probe.returncode == 0, _probe.stderr[-2000:]
+        _rust_out = _json.loads(_probe.stdout)
+        # Oracle = the REAL decrypt_credential_blob (env keys pointed at _CSEC).
+        _saved_cred2 = _os.environ.get("CREDENTIAL_ENCRYPTION_KEY")
+        _saved_secret = _os.environ.get("SECRET_KEY")
+        try:
+            _os.environ["CREDENTIAL_ENCRYPTION_KEY"] = _CSEC
+            _os.environ.pop("SECRET_KEY", None)
+            _py_expect = []
+            for tok in _py_toks:
+                try:
+                    _py_expect.append({"ok": _cc.decrypt_credential_blob(tok)})
+                except UnicodeEncodeError:
+                    _py_expect.append({"err": "NonAsciiInput"})
+                except ValueError:
+                    _py_expect.append({"err": "CannotDecrypt"})
+        finally:
+            _os.environ.pop("CREDENTIAL_ENCRYPTION_KEY", None)
+            if _saved_cred2 is not None:
+                _os.environ["CREDENTIAL_ENCRYPTION_KEY"] = _saved_cred2
+            if _saved_secret is not None:
+                _os.environ["SECRET_KEY"] = _saved_secret
+        assert len(_rust_out) == len(_py_expect), len(_rust_out)
+        for i, (r, p) in enumerate(zip(_rust_out, _py_expect)):
+            check(f"cdec[{i}]", r, p)
+        # legacy fallback: token under old secret, new secret first
+        _oldf = _PyFernet(_b64.urlsafe_b64encode(_hl.sha256(b"old-secret").digest()))
+        _legacy_tok = _oldf.encrypt(b"legacy-data").decode()
+        _probe2 = subprocess.run(
+            ["cargo", "run", "--quiet", "--example", "decrypt_probe", "--",
+             "new-secret,old-secret", _legacy_tok, _py_toks[0]],
+            cwd=RUST, capture_output=True, text=True,
+        )
+        assert _probe2.returncode == 0, _probe2.stderr[-2000:]
+        _r2 = _json.loads(_probe2.stdout)
+        check("cdec.legacy", _r2[0], {"ok": "legacy-data"})
+        check("cdec.legacy.py",
+              _cc._fernet("old-secret").decrypt(_legacy_tok.encode()).decode(), "legacy-data")
+        check("cdec.newkey_miss", _r2[1], {"err": "CannotDecrypt"})
+        # key derivation identical
+        check("ckey", vec["ckey"], _b64.urlsafe_b64encode(
+            _hl.sha256(_CSEC.encode()).digest()).decode())
+        # encrypt(None) → encrypts "" → decrypts to "" (with a key configured)
+        _saved_cred = _os.environ.get("CREDENTIAL_ENCRYPTION_KEY")
+        try:
+            _os.environ["CREDENTIAL_ENCRYPTION_KEY"] = "probe-key"
+            _none_tok = _cc.encrypt_credential_blob(None)
+        finally:
+            _os.environ.pop("CREDENTIAL_ENCRYPTION_KEY", None)
+            if _saved_cred is not None:
+                _os.environ["CREDENTIAL_ENCRYPTION_KEY"] = _saved_cred
+        _probef = _PyFernet(_b64.urlsafe_b64encode(_hl.sha256(b"probe-key").digest()))
+        check("cenc.none", _probef.decrypt(_none_tok.encode()).decode(), "")
+
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")
         return 1

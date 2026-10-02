@@ -1362,7 +1362,21 @@ fn main() {
         optv(&snap.memory_current),
         optv(&snap.memory_max)
     );
-    out += &format!("\"tcap_fmt\":{}\n", jstr(&tc::format_capacity(&snap)));
+    out += &format!("\"tcap_fmt\":{},\n", jstr(&tc::format_capacity(&snap)));
+
+    // credential_crypto vectors: tokens for Python to decrypt + decrypt results.
+    use qd_engine::credential_crypto as cc;
+    let csec = "qd-parity-secret";
+    let cplain: &[&str] = &["", "{\"api_key\":\"ABC123\"}", "caf\u{00e9} \u{1f600}", "x"];
+    let mut cenc: Vec<String> = Vec::new();
+    for p in cplain {
+        cenc.push(jstr(&cc::encrypt_credential_blob(csec, Some(p))));
+    }
+    // fixed token (deterministic: ts + zero IV) — Python decrypts it.
+    cenc.push(jstr(&cc::fernet_encrypt_with(csec, b"fixed-vector", 1_767_225_600, [0u8; 16])));
+    out += &format!("\"cenc\":[{}],\n", cenc.join(","));
+    // key derivation check: base64url(sha256(secret))
+    out += &format!("\"ckey\":{}\n", jstr(&cc::b64url_encode(&cc::fernet_key_bytes(csec))));
     out += "}\n";
     print!("{out}");
 }

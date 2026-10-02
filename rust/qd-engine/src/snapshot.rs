@@ -191,6 +191,16 @@ pub fn sha256_hex(data: &[u8]) -> String {
     h.iter().map(|w| format!("{w:08x}")).collect::<Vec<_>>().join("")
 }
 
+/// Raw SHA-256 digest bytes (same FIPS 180-4 core as [`sha256_hex`]).
+pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let hex = sha256_hex(data);
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("hex from sha256_hex");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1045,7 +1045,70 @@ fn main() {
         Some(s) => tvec.push(format!("\"{s}\"")),
         None => tvec.push("null".to_string()),
     }
-    out += &format!("\"tutil\":[{}]\n", tvec.join(","));
+    out += &format!("\"tutil\":[{}],\n", tvec.join(","));
+
+    // manifest vectors: same manifest shape, compare derived + metadata JSON.
+    use qd_engine::manifest as mf;
+    let mk = |market: &str, symbol: &str| qd_engine::instruments::InstrumentSpec {
+        market: market.into(),
+        symbol: symbol.into(),
+        exchange_id: String::new(),
+        market_type: String::new(),
+        instrument_id: format!("{market}:{symbol}"),
+    };
+    let mani = mf::StrategyManifest {
+        api_version: 2,
+        code_hash: "abc".into(),
+        strategy_type: "test".into(),
+        universe: mf::UniverseSpec {
+            kind: "static".into(),
+            reference: String::new(),
+            instruments: vec![mk("USStock", "AAPL"), mk("Crypto", "BTC/USDT")],
+        },
+        subscriptions: vec![
+            mf::SubscriptionSpec {
+                instruments: vec![mk("USStock", "AAPL")],
+                universe_reference: String::new(),
+                frequency: "1h".into(),
+                fields: ["open", "high", "low", "close", "volume"].iter().map(|s| s.to_string()).collect(),
+            },
+            mf::SubscriptionSpec {
+                instruments: vec![mk("Crypto", "BTC/USDT")],
+                universe_reference: String::new(),
+                frequency: "1d".into(),
+                fields: ["open", "high", "low", "close", "volume"].iter().map(|s| s.to_string()).collect(),
+            },
+        ],
+        schedules: vec![mf::ScheduleSpec {
+            frequency: "1d".into(),
+            callback: "on_open".into(),
+            time: "09:30".into(),
+            weekday: None,
+            monthday: None,
+        }],
+        benchmark: Some(mk("USStock", "SPY")),
+        handlers: vec!["on_bar".into()],
+        factor_dependencies: vec![],
+        fundamental_dependencies: vec!["pe".into()],
+        warmup_bars: 50,
+        leverage_allowed: false,
+        max_leverage: 1.0,
+        direction_mode: "long".into(),
+        metadata_fields: vec![],
+    };
+    let mut mvec: Vec<String> = vec![
+        format!("\"{}\"", mani.markets().join(",")),
+        format!("\"{}\"", mani.primary_frequency()),
+        format!("\"{}\"", mani.frequencies().join(",")),
+        format!("\"{}\"", mani.driving_frequency()),
+        // metadata JSON with single quotes (compare after quote-swap in check.py)
+        format!("\"{}\"", mani.metadata().dump().replace('"', "'")),
+    ];
+    // float rendering probes for maxLeverage-style values
+    for f in [1.0, 2.5, 0.1] {
+        mvec.push(format!("\"{}\"", mf::Meta::Float(f).dump()));
+    }
+    out += &format!("\"mani\":[{}]\n", mvec.join(","));
     out += "}\n";
     print!("{out}");
 }

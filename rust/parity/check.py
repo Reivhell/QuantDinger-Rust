@@ -901,6 +901,42 @@ def main() -> int:
     check("tutil.aware", vec["tutil"][len(_num_cases) + 14], py_to_utc(_aware))
     check("tutil.other", vec["tutil"][len(_num_cases) + 15], py_to_utc(object()))
 
+    # --- manifest: same manifest shape through the real dataclasses ---
+    import json as _json  # noqa: E402
+    from app.services.strategy_v2.models import (  # noqa: E402
+        InstrumentSpec as PyInst,
+        ScheduleSpec as PySched,
+        StrategyManifest as PyMani,
+        SubscriptionSpec as PySub,
+        UniverseSpec as PyUni,
+    )
+    _mk = lambda m, s: PyInst(market=m, symbol=s, instrument_id=f"{m}:{s}")
+    _py_mani = PyMani(
+        api_version=2, code_hash="abc", strategy_type="test",
+        universe=PyUni(kind="static",
+                       instruments=(_mk("USStock", "AAPL"), _mk("Crypto", "BTC/USDT"))),
+        subscriptions=(
+            PySub(instruments=(_mk("USStock", "AAPL"),), frequency="1h"),
+            PySub(instruments=(_mk("Crypto", "BTC/USDT"),), frequency="1d"),
+        ),
+        schedules=(PySched(frequency="1d", callback="on_open", time="09:30"),),
+        benchmark=_mk("USStock", "SPY"),
+        handlers=("on_bar",),
+        fundamental_dependencies=("pe",),
+        warmup_bars=50, direction_mode="long",
+    )
+    _mv = vec["mani"]
+    assert len(_mv) == 8, len(_mv)
+    check("mani.markets", _mv[0], ",".join(_py_mani.markets))
+    check("mani.primary", _mv[1], _py_mani.primary_frequency)
+    check("mani.freqs", _mv[2], ",".join(_py_mani.frequencies))
+    check("mani.driving", _mv[3], _py_mani.driving_frequency)
+    check("mani.metadata", _json.loads(_mv[4].replace("'", '"')),
+          _json.loads(_json.dumps(_py_mani.metadata(), sort_keys=True,
+                                  default=str)))
+    for i, f in enumerate([1.0, 2.5, 0.1]):
+        check(f"mani.float[{i}]", _mv[5 + i], repr(f))
+
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")
         return 1

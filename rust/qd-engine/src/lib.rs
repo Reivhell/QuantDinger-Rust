@@ -39,6 +39,9 @@
 //! - `timeutil` — `to_utc_iso` from `app/utils/timeutil.py`
 //!   (epoch/ISO/aware inputs → UTC `Z` strings; naive = UTC wall clock,
 //!   non-UTC naive zones stay Python-side)
+//! - `manifest` — `app/services/strategy_v2/models.py`
+//!   (universe/subscription/schedule specs + manifest derivations: markets,
+//!   frequencies, driving frequency, metadata shapes)
 
 pub mod close_reason;
 pub mod curve_sampling;
@@ -49,6 +52,7 @@ pub mod instruments;
 pub mod grid;
 pub mod indicators;
 pub mod language;
+pub mod manifest;
 pub mod market_visibility;
 pub mod net_pnl;
 pub mod perf_metrics;

@@ -32,6 +32,8 @@
 //! - `snapshot` — content-addressing core of
 //!   `app/services/strategy_v2/snapshot.py` (canonical snapshot bytes,
 //!   Python-float rendering, id validation)
+//! - `readiness` — `app/services/strategy_v2/readiness.py`
+//!   (universe-history gate, warmup-bar counts, fundamental-field checks)
 
 pub mod close_reason;
 pub mod curve_sampling;
@@ -47,5 +49,6 @@ pub mod perf_metrics;
 pub mod pnl;
 pub mod precise;
 pub mod protection;
+pub mod readiness;
 pub mod risk_guard;
 pub mod snapshot;

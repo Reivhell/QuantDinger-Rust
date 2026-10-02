@@ -906,7 +906,65 @@ fn main() {
             Err(e) => svec.push(format!("\"ERR:{e}\"")),
         }
     }
-    out += &format!("\"snap\":[{}]\n", svec.join(","));
+    out += &format!("\"snap\":[{}],\n", svec.join(","));
+
+    // readiness vectors: universe gate + warmup counts + fundamentals.
+    use qd_engine::readiness as rd;
+    const RB: i64 = 1_767_225_600; // 2026-01-01 00:00 UTC
+    const RD: i64 = 86_400;
+    let mut rvec: Vec<String> = Vec::new();
+    // universe: [ok|ERR] for (snapshot_only, start_offset_days)
+    for (only, off) in [(true, -1), (true, 0), (false, -1)] {
+        let start = rd::Zoned::utc(RB + off * RD);
+        match rd::validate_universe_history(
+            Some("U1"), Some(rd::Zoned::utc(RB)), None, only, Some("2026-01-01"), start,
+        ) {
+            Ok(()) => rvec.push("\"ok\"".to_string()),
+            Err(e) => rvec.push(format!("\"ERR:{e}\"")),
+        }
+    }
+    // warmup: 5-bar frame with bar1 zero/None, warmup 4 vs 5, member valid_from
+    let wmk = |bad: bool| rd::WarmupFrame {
+        ts: (0..5).map(|i| RB + i * RD).collect(),
+        open: (0..5).map(|i| if bad && i == 1 { Some(0.0) } else { Some(100.0) }).collect(),
+        high: (0..5).map(|_| Some(101.0)).collect(),
+        low: (0..5).map(|_| Some(99.0)).collect(),
+        close: (0..5).map(|i| if bad && i == 1 { None } else { Some(100.5) }).collect(),
+    };
+    let wframes = |bad: bool| {
+        vec![("1d".to_string(), vec![("S".to_string(), wmk(bad))])]
+    };
+    for (bad, w, start) in [(true, 5, RB + 5 * RD), (true, 4, RB + 5 * RD), (false, 5, RB + 5 * RD)] {
+        match rd::validate_warmup(&wframes(bad), w, start, &[]) {
+            Ok(()) => rvec.push("\"ok\"".to_string()),
+            Err(e) => rvec.push(format!("\"ERR:{e}\"")),
+        }
+    }
+    let members = vec![rd::Member { key: "S".to_string(), valid_from: Some(RB + 3 * RD) }];
+    match rd::validate_warmup(&wframes(false), 5, RB, &members) {
+        Ok(()) => rvec.push("\"ok\"".to_string()),
+        Err(e) => rvec.push(format!("\"ERR:{e}\"")),
+    }
+    // fundamentals: pe ok / pb all-None / roe absent; as_of full vs cut
+    use std::collections::{HashMap, HashSet};
+    let mut cols = HashMap::new();
+    cols.insert("pe".to_string(), vec![Some(10.0), Some(f64::INFINITY), None]);
+    cols.insert("pb".to_string(), vec![None, None, None]);
+    let fframes = vec![(
+        "S".to_string(),
+        rd::FundFrame { ts: vec![RB, RB + RD, RB + 2 * RD], cols },
+    )];
+    let req: HashSet<String> = ["pe".into(), "pb".into(), "roe".into()].into_iter().collect();
+    for as_of in [None, Some(RB - RD)] {
+        match rd::validate_fundamentals(&fframes, &req, as_of) {
+            Ok(()) => rvec.push("\"ok\"".to_string()),
+            Err(e) => rvec.push(format!("\"ERR:{e}\"")),
+        }
+    }
+    // cal_date probe: 2025-12-31 23:00 UTC +2h offset → 2026-01-01 local
+    let (y, m, d) = rd::cal_date(rd::Zoned { epoch: RB - 3_600, offset: 7_200 });
+    rvec.push(format!("\"{y:04}-{m:02}-{d:02}\""));
+    out += &format!("\"ready\":[{}]\n", rvec.join(","));
     out += "}\n";
     print!("{out}");
 }

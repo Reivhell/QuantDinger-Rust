@@ -88,6 +88,18 @@ _load("app.services.strategy_v2.models", "app/services/strategy_v2/models.py")
 _load("app.services.market_schedule", "app/services/market_schedule.py")
 _load("app.services.backtest_metrics", "app/services/backtest/metrics.py")
 _load("app.services.strategy_v2.instruments", "app/services/strategy_v2/instruments.py")
+# readiness.py needs only StrategyV2ContractError (a ValueError with .code)
+# from the heavy contract module — stub it so the real readiness loads.
+_contract_stub = _stub("app.services.strategy_v2.contract")
+exec(  # noqa: S102
+    "class StrategyV2ContractError(ValueError):\n"
+    "    def __init__(self, code):\n"
+    "        super().__init__(code)\n"
+    "        self.code = code\n",
+    _contract_stub.__dict__,
+)
+setattr(sys.modules["app.services.strategy_v2"], "contract", _contract_stub)
+_load("app.services.strategy_v2.readiness", "app/services/strategy_v2/readiness.py")
 _load("app.services.strategy_v2.snapshot_mod", "app/services/strategy_v2/snapshot.py")
 _load("app.services.strategy_v2.data_portal", "app/services/strategy_v2/data.py")
 _load("app.services.strategy_v2.curve_sampling", "app/services/strategy_v2/curve_sampling.py")
@@ -757,6 +769,69 @@ def main() -> int:
     check("snap.id.bad", _sn[8], "ERR:strategyV2.snapshotIdInvalid")
     check("snap.id.upper", _sn[9], "ok:" + "a" * 64)
     check("snap.id.ok", _sn[10], f"ok:{'ab' * 32}")
+
+    # --- readiness: same gates through the real validators ---
+    from app.services.strategy_v2.readiness import (  # noqa: E402
+        validate_fundamentals as py_fund,
+        validate_universe_history as py_uni,
+        validate_warmup as py_warmup,
+    )
+    _RB = 1_767_225_600
+    _RD = 86_400
+
+    def _rd_call(fn, *args):
+        try:
+            fn(*args)
+            return "ok"
+        except Exception as e:  # noqa: BLE001
+            return f"ERR:{e}"
+
+    _rdy = vec["ready"]
+    assert len(_rdy) == 10, len(_rdy)
+    _uni_base = {"code": "U1", "history_from": "2026-01-01",
+                 "metadata": {"snapshot_only": True}}
+    _uni_off = dict(_uni_base, metadata={"snapshot_only": False})
+    check("ready.uni.before", _rdy[0],
+          _rd_call(py_uni, _uni_base, pd.Timestamp(_RB - _RD, unit="s")))
+    check("ready.uni.onday", _rdy[1],
+          _rd_call(py_uni, _uni_base, pd.Timestamp(_RB, unit="s")))
+    check("ready.uni.optout", _rdy[2],
+          _rd_call(py_uni, _uni_off, pd.Timestamp(_RB - _RD, unit="s")))
+    _widx = pd.date_range(pd.Timestamp(_RB, unit="s"), periods=5, freq="D")
+
+    def _wframe(bad: bool):
+        d = {"open": [100.0] * 5, "high": [101.0] * 5,
+             "low": [99.0] * 5, "close": [100.5] * 5}
+        if bad:
+            d["open"][1] = 0.0
+            d["close"][1] = None
+        return pd.DataFrame(d, index=_widx)
+
+    _wstart = pd.Timestamp(_RB + 5 * _RD, unit="s")
+    check("ready.warm.5bad", _rdy[3],
+          _rd_call(py_warmup, {"1d": {"S": _wframe(True)}}, 5, _wstart))
+    check("ready.warm.4bad", _rdy[4],
+          _rd_call(py_warmup, {"1d": {"S": _wframe(True)}}, 4, _wstart))
+    check("ready.warm.5ok", _rdy[5],
+          _rd_call(py_warmup, {"1d": {"S": _wframe(False)}}, 5, _wstart))
+    _members = ({"key": "S", "valid_from": pd.Timestamp(_RB + 3 * _RD, unit="s")},)
+    check("ready.warm.member", _rdy[6],
+          _rd_call(py_warmup, {"1d": {"S": _wframe(False)}}, 5,
+                   pd.Timestamp(_RB, unit="s"), _members))
+    _fframe = pd.DataFrame(
+        {"pe": [10.0, float("inf"), None], "pb": [None, None, None]},
+        index=pd.date_range(pd.Timestamp(_RB, unit="s"), periods=3, freq="D"),
+    )
+    _req = {"pe", "pb", "roe"}
+    check("ready.fund.full", _rdy[7],
+          _rd_call(py_fund, {"S": _fframe}, _req))
+    check("ready.fund.cut", _rdy[8],
+          _rd_call(py_fund, {"S": _fframe}, _req,
+                   pd.Timestamp(_RB - _RD, unit="s")))
+    import datetime as _dt  # noqa: E402
+    check("ready.caldate", _rdy[9],
+          str((_dt.datetime(2025, 12, 31, 23, tzinfo=_dt.timezone.utc)
+               + _dt.timedelta(hours=2)).date()))
 
     if FAILURES:
         print(f"\n{len(FAILURES)} parity FAILURES")

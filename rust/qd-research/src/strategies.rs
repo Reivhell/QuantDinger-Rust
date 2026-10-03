@@ -86,6 +86,54 @@ impl RsiMeanReversion {
     }
 }
 
+/// Donchian breakout, long-only (spot-first, §2): long when the close
+/// escapes the prior `lookback`-bar close-channel high with relative volume
+/// ≥ `relvol_min`. Gated to BREAKOUT / TRANSITION only — never chases in
+/// trends (late), ranges (fakeouts), volatility extremes (stops misbehave),
+/// or garbage. The channel is strictly prior bars (`< i`, never including
+/// `i`); warmup (`i < lookback`) is Flat. Volume re-checked here even though
+/// the BREAKOUT regime already requires participation — defense in depth.
+pub struct DonchianBreakout {
+    pub lookback: usize,
+    pub relvol_min: f64,
+}
+
+impl DonchianBreakout {
+    pub fn signals(&self, bars: &[crate::features::Bar], regimes: &[Regime]) -> Vec<Signal> {
+        let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+        let volumes: Vec<f64> = bars.iter().map(|b| b.volume).collect();
+        let rv = crate::features::relative_volume(&volumes, self.lookback.max(1));
+        closes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let reg = regimes.get(i).copied().unwrap_or(Regime::Transition);
+                match reg {
+                    Regime::Breakout | Regime::Transition => {}
+                    _ => return Signal::Flat,
+                }
+                if self.lookback == 0 || i < self.lookback {
+                    return Signal::Flat;
+                }
+                let win = &closes[(i - self.lookback)..i];
+                if win.iter().any(|v| !v.is_finite()) || !c.is_finite() {
+                    return Signal::Flat;
+                }
+                let hi = win.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let r = match rv.get(i).copied().flatten() {
+                    Some(v) if v.is_finite() => v,
+                    _ => return Signal::Flat,
+                };
+                if *c > hi && r >= self.relvol_min {
+                    Signal::Long
+                } else {
+                    Signal::Flat
+                }
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +214,41 @@ mod tests {
                 "{bad:?} must force flat"
             );
         }
+    }
+
+    fn donchian_bars() -> Vec<crate::features::Bar> {
+        // Flat 100s (vol 1x), then a volume-backed escape at bar 20.
+        (0..30)
+            .map(|i| {
+                let c = if i < 20 { 100.0 } else { 101.0 + (i - 20) as f64 * 0.5 };
+                let v = if i == 20 { 500.0 } else { 100.0 };
+                crate::features::Bar {
+                    t: i as i64, open: c, high: c + 0.2, low: c - 0.2,
+                    close: c, volume: v,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn donchian_fires_only_on_confirmed_escape() {
+        let bars = donchian_bars();
+        let regs = vec![Regime::Transition; bars.len()];
+        let sig = DonchianBreakout { lookback: 20, relvol_min: 1.5 }
+            .signals(&bars, &regs);
+        // Warmup flat; escape bar 20 fires (close 101 > prior high 100,
+        // relvol 5x); later bars sit inside their own channel → flat.
+        assert!(sig[..20].iter().all(|s| *s == Signal::Flat));
+        assert_eq!(sig[20], Signal::Long);
+        // Thin-volume escape is not a breakout.
+        let mut thin = donchian_bars();
+        thin[20].volume = 100.0;
+        let sig2 = DonchianBreakout { lookback: 20, relvol_min: 1.5 }
+            .signals(&thin, &vec![Regime::Transition; thin.len()]);
+        assert!(sig2.iter().all(|s| *s == Signal::Flat));
+        // Ranging gate forces flat even on a real escape.
+        let sig3 = DonchianBreakout { lookback: 20, relvol_min: 1.5 }
+            .signals(&bars, &vec![Regime::Ranging; bars.len()]);
+        assert!(sig3.iter().all(|s| *s == Signal::Flat));
     }
 }

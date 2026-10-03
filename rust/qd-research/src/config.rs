@@ -39,6 +39,8 @@ pub struct ResearchConfig {
     pub rsi_oversold: f64,
     pub rsi_overbought: f64,
     pub rsi_shorts: bool,
+    pub donchian_lookback: usize,
+    pub donchian_relvol: f64,
     pub stop_loss: f64,
     pub take_profit: f64,
     pub risk_fraction: f64,
@@ -98,6 +100,8 @@ impl Default for ResearchConfig {
             rsi_oversold: 30.0,
             rsi_overbought: 70.0,
             rsi_shorts: false,
+            donchian_lookback: 20,
+            donchian_relvol: 1.5,
             stop_loss: 0.03,
             take_profit: 0.06,
             risk_fraction: 0.01,
@@ -200,6 +204,12 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
     if let Some(v) = want(&root, &mut bad, "strategy", "rsi_overbought") {
         cfg.rsi_overbought = v;
     }
+    if let Some(v) = want(&root, &mut bad, "strategy", "donchian_lookback") {
+        cfg.donchian_lookback = (v as usize).max(1);
+    }
+    if let Some(v) = want(&root, &mut bad, "strategy", "donchian_relvol") {
+        cfg.donchian_relvol = v;
+    }
     if let Some(v) = want(&root, &mut bad, "strategy", "stop_loss") {
         cfg.stop_loss = v;
     }
@@ -295,8 +305,12 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
         if !(0.0 < cfg.rsi_oversold && cfg.rsi_oversold < cfg.rsi_overbought && cfg.rsi_overbought < 100.0) {
             return Err("config: need 0 < rsi_oversold < rsi_overbought < 100".into());
         }
+    } else if cfg.strategy_name == "DonchianBreakout" {
+        if cfg.donchian_relvol <= 0.0 {
+            return Err("config: strategy.donchian_relvol must be > 0".into());
+        }
     } else if cfg.strategy_name != "EmaCrossTrend" {
-        return Err(format!("config: unknown strategy.name '{}' (EmaCrossTrend | RsiMeanReversion)", cfg.strategy_name));
+        return Err(format!("config: unknown strategy.name '{}' (EmaCrossTrend | RsiMeanReversion | DonchianBreakout)", cfg.strategy_name));
     }
     if cfg.bars < cfg.wf_train + cfg.wf_oos {
         return Err("config: data.bars must fit one walk-forward train+oos window".into());

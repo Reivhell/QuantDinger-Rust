@@ -21,7 +21,7 @@ use qd_research::pbo::{analyze_overfitting, PboBands, ScoreMatrix};
 use qd_research::regime::{detect, RegimeConfig};
 use qd_research::report::{regime_slices, report_json, report_markdown, ResearchInput};
 use qd_research::sensitivity::{analyze_sensitivity, ParamPoint};
-use qd_research::strategies::{EmaCrossTrend, RsiMeanReversion};
+use qd_research::strategies::{DonchianBreakout, EmaCrossTrend, RsiMeanReversion};
 use qd_research::walkforward::{build_folds, summarize_walkforward, FoldOutcome};
 
 fn main() {
@@ -65,25 +65,37 @@ fn main() {
     let regimes = detect(&bars, &session, &rcfg);
 
     // Strategy under test, from `strategy.name`: EMA-cross trend (rides
-    // trends + breakouts) or RSI mean-reversion (buys dips in chop/range).
-    // Both share the same pipeline below — only the signal source differs.
+    // trends + breakouts), RSI mean-reversion (buys dips in chop/range), or
+    // Donchian breakout (volume-confirmed range escapes, long-only).
+    // All share the same pipeline below — only the signal source differs.
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-    let use_rsi = cfg.strategy_name == "RsiMeanReversion";
-    let signals = if use_rsi {
-        RsiMeanReversion {
+    let fam: &str = match cfg.strategy_name.as_str() {
+        "RsiMeanReversion" => "rsi",
+        "DonchianBreakout" => "donchian",
+        _ => "ema",
+    };
+    let use_rsi = fam == "rsi";
+    let signals = match fam {
+        "rsi" => RsiMeanReversion {
             period: cfg.rsi_period,
             oversold: cfg.rsi_oversold,
             overbought: cfg.rsi_overbought,
             allow_shorts: cfg.rsi_shorts,
         }
-        .signals(&closes, &regimes)
-    } else {
-        EmaCrossTrend { fast: cfg.ema_fast, slow: cfg.ema_slow }.signals(&closes, &regimes)
+        .signals(&closes, &regimes),
+        "donchian" => DonchianBreakout {
+            lookback: cfg.donchian_lookback,
+            relvol_min: cfg.donchian_relvol,
+        }
+        .signals(&bars, &regimes),
+        _ => EmaCrossTrend { fast: cfg.ema_fast, slow: cfg.ema_slow }.signals(&closes, &regimes),
     };
-    let wf_label = if use_rsi {
-        format!("rsi{}/{}-{}", cfg.rsi_period, cfg.rsi_oversold, cfg.rsi_overbought)
-    } else {
-        format!("ema{}/{}", cfg.ema_fast, cfg.ema_slow)
+    let wf_label = match fam {
+        "rsi" => format!("rsi{}/{}-{}", cfg.rsi_period, cfg.rsi_oversold, cfg.rsi_overbought),
+        "donchian" => {
+            format!("donch{}/rv{:.1}", cfg.donchian_lookback, cfg.donchian_relvol)
+        }
+        _ => format!("ema{}/{}", cfg.ema_fast, cfg.ema_slow),
     };
     let feature_ids = vec![1u64; n];
     let exec = ExecConfig {
@@ -150,6 +162,7 @@ fn main() {
 
     // PBO over a small honest grid. EMA: fast ∈ {10,20,30} × slow ∈ {50,100}.
     // RSI: period ∈ {7,14,21} × oversold ∈ {25,30,35} (overbought fixed).
+    // Donchian: lookback ∈ {10,20,30} × relvol ∈ {1.5,2.0}.
     // Same folds, IS robust-return vs OOS robust-return — IS/OOS degradation
     // decides. Robust = total return with a trade-count floor: Sharpe on
     // 0-2 trades is ±infinity garbage (var≈0), so windows with <3 trades
@@ -158,45 +171,58 @@ fn main() {
     let mut is_m = Vec::new();
     let mut oos_m = Vec::new();
     // (label, signal-builder): boxed so the family loop below is shared.
-    let grid: Vec<(String, Box<dyn Fn(&[f64], &[qd_research::regime::Regime]) -> Vec<qd_research::backtest::Signal>>)> =
-        if use_rsi {
-            let mut g: Vec<(String, Box<dyn Fn(&[f64], &[qd_research::regime::Regime]) -> Vec<qd_research::backtest::Signal>>)> = Vec::new();
-            for p in [7usize, 14, 21] {
-                for os in [25.0f64, 30.0, 35.0] {
-                    let ob = cfg.rsi_overbought;
-                    let sh = cfg.rsi_shorts;
-                    g.push((
-                        format!("rsi{p}/{os}-{ob}"),
-                        Box::new(move |c: &[f64], r: &[qd_research::regime::Regime]| {
-                            RsiMeanReversion { period: p, oversold: os, overbought: ob, allow_shorts: sh }.signals(c, r)
-                        }),
-                    ));
-                }
+    type SigFn = dyn Fn(&[qd_research::features::Bar], &[f64], &[qd_research::regime::Regime]) -> Vec<qd_research::backtest::Signal>;
+    let grid: Vec<(String, Box<SigFn>)> = if fam == "donchian" {
+        let mut g: Vec<(String, Box<SigFn>)> = Vec::new();
+        for lb in [10usize, 20, 30] {
+            for rv in [1.5f64, 2.0] {
+                g.push((
+                    format!("donch{lb}/rv{rv:.1}"),
+                    Box::new(move |b, _, r| {
+                        DonchianBreakout { lookback: lb, relvol_min: rv }.signals(b, r)
+                    }),
+                ));
             }
-            g
-        } else {
-            let mut g: Vec<(String, Box<dyn Fn(&[f64], &[qd_research::regime::Regime]) -> Vec<qd_research::backtest::Signal>>)> = Vec::new();
-            for fast in [10usize, 20, 30] {
-                for slow in [50usize, 100] {
-                    if fast >= slow {
-                        continue;
-                    }
-                    g.push((
-                        format!("ema{fast}/{slow}"),
-                        Box::new(move |c: &[f64], r: &[qd_research::regime::Regime]| {
-                            EmaCrossTrend { fast, slow }.signals(c, r)
-                        }),
-                    ));
-                }
+        }
+        g
+    } else if use_rsi {
+        let mut g: Vec<(String, Box<SigFn>)> = Vec::new();
+        for p in [7usize, 14, 21] {
+            for os in [25.0f64, 30.0, 35.0] {
+                let ob = cfg.rsi_overbought;
+                let sh = cfg.rsi_shorts;
+                g.push((
+                    format!("rsi{p}/{os}-{ob}"),
+                    Box::new(move |_, c: &[f64], r: &[qd_research::regime::Regime]| {
+                        RsiMeanReversion { period: p, oversold: os, overbought: ob, allow_shorts: sh }.signals(c, r)
+                    }),
+                ));
             }
-            g
-        };
+        }
+        g
+    } else {
+        let mut g: Vec<(String, Box<SigFn>)> = Vec::new();
+        for fast in [10usize, 20, 30] {
+            for slow in [50usize, 100] {
+                if fast >= slow {
+                    continue;
+                }
+                g.push((
+                    format!("ema{fast}/{slow}"),
+                    Box::new(move |_, c: &[f64], r: &[qd_research::regime::Regime]| {
+                        EmaCrossTrend { fast, slow }.signals(c, r)
+                    }),
+                ));
+            }
+        }
+        g
+    };
     for (label, build) in &grid {
         cfgs.push(label.clone());
         let mut is_row = Vec::new();
         let mut oos_row = Vec::new();
         for f in build_folds(n, cfg.wf_train, cfg.wf_oos, cfg.wf_step, false) {
-            let sg = build(&closes, &regimes);
+            let sg = build(&bars, &closes, &regimes);
             for (lo, hi) in [(f.is_start, f.is_end), (f.oos_start, f.oos_end)] {
                 let r = run_backtest(
                     &bars[lo..hi],
@@ -227,9 +253,11 @@ fn main() {
 
     // Sensitivity around the configured knob (full-sample robust return —
     // total return with the same <3-trade floor, so thin windows score 0
-    // instead of Sharpe ±infinity): EMA fast, or RSI period for the
-    // mean-reversion family. Plateau = robust.
-    let (sens_name, sens_base, sens_vals): (&str, f64, Vec<f64>) = if use_rsi {
+    // instead of Sharpe ±infinity): EMA fast, RSI period, or Donchian
+    // lookback. Plateau = robust.
+    let (sens_name, sens_base, sens_vals): (&str, f64, Vec<f64>) = if fam == "donchian" {
+        ("donchian_lookback", cfg.donchian_lookback as f64, vec![10.0, 15.0, 20.0, 25.0, 30.0])
+    } else if use_rsi {
         ("rsi_period", cfg.rsi_period as f64, vec![7.0, 10.0, 14.0, 18.0, 21.0])
     } else {
         let d: [i64; 4] = [-2, -1, 1, 2];
@@ -239,7 +267,13 @@ fn main() {
         ("ema_fast", cfg.ema_fast as f64, v)
     };
     let score_of = |val: f64| {
-        let sg = if use_rsi {
+        let sg = if fam == "donchian" {
+            DonchianBreakout {
+                lookback: (val as usize).max(2),
+                relvol_min: cfg.donchian_relvol,
+            }
+            .signals(&bars, &regimes)
+        } else if use_rsi {
             RsiMeanReversion {
                 period: (val as usize).max(2),
                 oversold: cfg.rsi_oversold,
@@ -275,9 +309,9 @@ fn main() {
 
     // Shadow bulkhead (§12): the LAST third of bars is unseen by every
     // earlier stage (WF folds, CPCV runs, PBO grid all score IS/OOS windows
-    // of their own — none trains here). The candidate (configured EMA) runs
+    // of their own — none trains here). The configured candidate runs
     // under the autonomous gate + live kill-switch against a duller
-    // incumbent (slow EMA); the drawdown-first verdict feeds the
+    // incumbent of the same family; the drawdown-first verdict feeds the
     // Shadow → Deploy loop transition.
     let shadow_lo = 2 * n / 3;
     let shadow = {
@@ -319,9 +353,14 @@ fn main() {
         }, &scfg)
         .expect("shadow candidate runs");
         // Incumbent: a duller sibling of the same family on the same unseen
-        // window — slow EMA for the trend family, slow/long RSI for the
-        // mean-reversion family.
-        let inc_sig = if use_rsi {
+        // window — slow EMA, slow/long RSI, or longer-channel Donchian.
+        let inc_sig = if fam == "donchian" {
+            DonchianBreakout {
+                lookback: cfg.donchian_lookback + 10,
+                relvol_min: cfg.donchian_relvol,
+            }
+            .signals(&bars, &regimes)
+        } else if use_rsi {
             RsiMeanReversion {
                 period: cfg.rsi_period + 7,
                 oversold: cfg.rsi_oversold - 5.0,
@@ -373,7 +412,19 @@ fn main() {
         }
     };
 
-    let (strat_label, strat_cfg) = if use_rsi {
+    let (strat_label, strat_cfg) = if fam == "donchian" {
+        (
+            format!(
+                "DonchianBreakout({},rv{:.1})",
+                cfg.donchian_lookback, cfg.donchian_relvol
+            ),
+            format!(
+                "lookback={} relvol={:.2} stop={:.3} take={:.3} risk={:.3}",
+                cfg.donchian_lookback, cfg.donchian_relvol,
+                cfg.stop_loss, cfg.take_profit, cfg.risk_fraction
+            ),
+        )
+    } else if use_rsi {
         (
             format!(
                 "RsiMeanReversion({},{:.0},{:.0}{})",

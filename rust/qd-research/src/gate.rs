@@ -22,6 +22,7 @@ use crate::montecarlo::MonteCarloReport;
 use crate::pbo::PboReport;
 use crate::sensitivity::SensitivityReport;
 use crate::shadow::{ShadowSummary, ShadowVerdict};
+use crate::snooping::SnoopReport;
 use crate::walkforward::WalkForwardReport;
 
 /// OOS bar: walk-forward needs at least half the folds OOS-positive
@@ -40,6 +41,11 @@ pub const DEGRADATION_MAX: f64 = 0.5;
 /// Sensitivity bar: only a plateaued knob passes — UNSTABLE / SPIKE /
 /// NO_EDGE all fail closed.
 pub const SENSITIVITY_PASS: &str = "STABLE";
+/// Data-snooping bar: the grid-best OOS edge must survive the White/SPA
+/// luck adjustment (consistent p < 5%, same bar the snoop module uses).
+/// Missing/thin evidence (`None`) fails closed — an untested grid is not
+/// an honest grid.
+pub const SNOOP_ALPHA: f64 = 0.05;
 
 /// Measured evidence for one strategy run. Plain data in, gate out —
 /// no I/O, no globals, deterministic.
@@ -68,6 +74,9 @@ pub struct GateEvidence {
     /// Kill-switch tripped correctly in shadow when it had to
     /// (or shadow never needed it — verified present either way).
     pub killswitch_verified: bool,
+    /// Data-snooping report (White RC + Hansen SPA over the grid OOS
+    /// matrix). `None` = too thin to test → fails closed, never faked.
+    pub snooping: Option<SnoopReport>,
     /// Shadow verdict from the unseen holdout window.
     pub shadow: Option<ShadowVerdictSummary>,
 }
@@ -134,10 +143,17 @@ pub fn gate_from_evidence(ev: &GateEvidence) -> DeploymentGate {
     let dd_ok = ev.backtest_max_dd <= ev.max_drawdown_cap;
     let shadow_ok =
         matches!(ev.shadow, Some(ShadowVerdictSummary::Promote));
+    // Data-snooping (§7 luck adjustment): the grid-best OOS edge must
+    // survive White + SPA at 5%. Thin/missing evidence fails closed.
+    let snoop_ok = ev
+        .snooping
+        .as_ref()
+        .map(|s| s.white_p < SNOOP_ALPHA && s.spa_p_consistent < SNOOP_ALPHA)
+        .unwrap_or(false);
     // OOS validation (§13 `oos_validated`) needs *independent* confirmation
     // from two directions: walk-forward folds AND the CPCV/PBO path.
     // WF alone can pass on 2 folds; PBO alone can pass on a lucky grid.
-    let oos_validated = oos_ok && pbo_ok && no_overfit;
+    let oos_validated = oos_ok && pbo_ok && no_overfit && snoop_ok;
     DeploymentGate {
         no_lookahead: true, // backtest latency>=1 + causal features
         no_leakage: true,   // purged walk-forward + CPCV splitters
@@ -181,6 +197,7 @@ mod tests {
             stop_on_every_trade: true,
             leverage_ok: true,
             killswitch_verified: true,
+            snooping: None, // most unit fixtures don't run the bootstrap
             shadow: Some(ShadowVerdictSummary::Promote),
         }
     }
@@ -269,8 +286,66 @@ mod tests {
         mc.boot_return = summarize(vec![0.02; 200]);
         mc.shuffled_max_dd = summarize(vec![0.01; 200]);
         e.monte_carlo = Some(mc);
+        // Snooping: grid-best survives the luck adjustment (both p < 5%).
+        e.snooping = Some(crate::snooping::SnoopReport {
+            rules: 2,
+            periods: 12,
+            boot_sims: 500,
+            mean_block: 4,
+            best_rule: 0,
+            best_mean: 0.02,
+            white_stat: 3.1,
+            white_p: 0.01,
+            spa_stat: 2.8,
+            spa_p_lower: 0.02,
+            spa_p_consistent: 0.02,
+            spa_p_upper: 0.30,
+            assessment: "EDGE SURVIVES SNOOPING",
+        });
         let g = gate_from_evidence(&e);
         assert!(g.deploy_allowed(), "full evidence must pass: {:?}", g.failures());
+    }
+
+    #[test]
+    fn snooping_blocks_oos_without_other_failures() {
+        // Every stage passes except snooping (None = thin grid): OOS must
+        // stay unvalidated — an untested grid is not an honest grid.
+        let mut e = ev();
+        e.walkforward = Some(crate::walkforward::summarize_walkforward(
+            vec![crate::walkforward::FoldOutcome {
+                fold: 0,
+                selected_config: "a".into(),
+                is_score: 0.1,
+                oos_return: 0.05,
+                oos_max_dd: 0.01,
+                oos_sharpe: 1.0,
+                oos_sortino: 1.0,
+                oos_trades: 5,
+            }],
+            0.5,
+        ));
+        let m = ScoreMatrix {
+            configs: vec!["a".into(), "b".into()],
+            is: vec![vec![0.2, 0.2], vec![0.1, 0.1]],
+            oos: vec![vec![0.2, 0.2], vec![0.0, 0.0]],
+        };
+        e.pbo = Some(crate::pbo::analyze_overfitting(&m, &PboBands::default()));
+        let base = ParamPoint { name: "k".into(), value: 20.0, score: 0.05 };
+        let sweep = vec![
+            ParamPoint { name: "k".into(), value: 10.0, score: 0.048 },
+            ParamPoint { name: "k".into(), value: 30.0, score: 0.052 },
+        ];
+        e.sensitivity = Some(analyze_sensitivity(base, &sweep, 0.8, 0.3));
+        let rets = vec![0.01; 40];
+        let mut mc: MonteCarloReport =
+            crate::montecarlo::run_monte_carlo(&rets, 200, 7);
+        mc.boot_return = summarize(vec![0.02; 200]);
+        mc.shuffled_max_dd = summarize(vec![0.01; 200]);
+        e.monte_carlo = Some(mc);
+        // snooping stays None → oos_validated false, everything else green.
+        let g = gate_from_evidence(&e);
+        assert!(!g.oos_validated, "missing snooping must block OOS validation");
+        assert!(g.failures().contains(&"oos_not_validated"));
     }
 
     #[test]

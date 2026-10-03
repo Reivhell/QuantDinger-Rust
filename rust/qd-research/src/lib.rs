@@ -15,8 +15,9 @@
 //!   purge + embargo overlapping labels.
 //! - Reproducibility: all stochastic code takes an explicit `seed`
 //!   (SplitMix64, see [`montecarlo`]).
-//! - Data snooping: White's Reality Check / Hansen SPA are reported as
-//!   NOT IMPLEMENTED with reasons, never faked ([`report`]).
+//! - Data snooping: White's Reality Check + Hansen SPA over the grid OOS
+//!   matrix ([`snooping`]); p-values approximate under overlapping CPCV
+//!   windows, stated as such — never faked.
 
 pub mod backtest;
 pub mod autonomy;
@@ -35,5 +36,6 @@ pub mod report;
 pub mod risk;
 pub mod sensitivity;
 pub mod shadow;
+pub mod snooping;
 pub mod strategies;
 pub mod walkforward;

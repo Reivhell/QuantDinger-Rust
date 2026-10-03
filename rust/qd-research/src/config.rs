@@ -83,6 +83,12 @@ pub struct ResearchConfig {
     pub wf_oos: usize,
     pub wf_step: usize,
     pub min_oos_fraction: f64,
+    // data-snooping (White + SPA): reproducibility knobs only — sim count,
+    // seed, mean block length. Validity bars (min_periods=10, alpha=0.05)
+    // stay fixed in their modules, never config-lowerable.
+    pub snoop_sims: usize,
+    pub snoop_seed: u64,
+    pub snoop_block: usize,
 }
 
 impl Default for ResearchConfig {
@@ -126,6 +132,9 @@ impl Default for ResearchConfig {
             wf_oos: 150,
             wf_step: 150,
             min_oos_fraction: 0.5,
+            snoop_sims: 5000,
+            snoop_seed: 43,
+            snoop_block: 4,
         }
     }
 }
@@ -282,6 +291,15 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
     if let Some(v) = want(&root, &mut bad, "robustness", "min_oos_fraction") {
         cfg.min_oos_fraction = v;
     }
+    if let Some(v) = want(&root, &mut bad, "robustness", "snoop_sims") {
+        cfg.snoop_sims = v as usize;
+    }
+    if let Some(v) = want(&root, &mut bad, "robustness", "snoop_seed") {
+        cfg.snoop_seed = v as u64;
+    }
+    if let Some(v) = want(&root, &mut bad, "robustness", "snoop_block") {
+        cfg.snoop_block = v as usize;
+    }
     if let Some(v) = obj(&root, "strategy").and_then(|o| obj(o, "rsi_shorts")) {
         match v {
             JsonVal::Bool(b) => cfg.rsi_shorts = *b,
@@ -317,6 +335,12 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
     }
     if cfg.cpcv_test == 0 || cfg.cpcv_test >= cfg.cpcv_partitions.max(2) {
         return Err("config: need 1 <= robustness.cpcv_test < cpcv_partitions".into());
+    }
+    if cfg.snoop_sims == 0 {
+        return Err("config: robustness.snoop_sims must be >= 1".into());
+    }
+    if cfg.snoop_block == 0 {
+        return Err("config: robustness.snoop_block must be >= 1".into());
     }
     // Hard risk guards (§1/§2/§4): reject, never clamp. The strategy,
     // optimizer, LLM context, and agent cannot override these.
@@ -391,6 +415,20 @@ mod tests {
         let r = load_config(r#"{"data": {"csv": "/tmp/btc_usdt_1d.csv", "bars": 1000}}"#).unwrap();
         assert_eq!(r.csv, "/tmp/btc_usdt_1d.csv");
         assert!(load_config(r#"{"data": {"csv": 42}}"#).is_err()); // type errors are loud
+    }
+
+    #[test]
+    fn snoop_knobs_default_and_validate() {
+        let c = load_config(DEFAULT_CONFIG_JSON).expect("default parses");
+        assert_eq!((c.snoop_sims, c.snoop_seed, c.snoop_block), (5000, 43, 4));
+        let r = load_config(
+            r#"{"robustness": {"snoop_sims": 2000, "snoop_seed": 7, "snoop_block": 6}}"#,
+        )
+        .unwrap();
+        assert_eq!((r.snoop_sims, r.snoop_seed, r.snoop_block), (2000, 7, 6));
+        assert!(load_config(r#"{"robustness": {"snoop_sims": 0}}"#).is_err());
+        assert!(load_config(r#"{"robustness": {"snoop_block": 0}}"#).is_err());
+        assert!(load_config(r#"{"robustness": {"snoop_sims": "lots"}}"#).is_err());
     }
 
     #[test]

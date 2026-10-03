@@ -2,7 +2,9 @@
 //!
 //! The final assessment reports evidence, never verdicts like "GOOD
 //! STRATEGY". Data-snooping controls (White's Reality Check, Hansen SPA)
-//! are reported as NOT IMPLEMENTED with reasons — never faked.
+//! report real bootstrap p-values from [`crate::snooping`] — or
+//! "INSUFFICIENT DATA" when the OOS matrix cannot support the asymptotics,
+//! never a fabricated pass.
 
 use crate::costs::CostStressRow;
 use crate::mae_mfe::MaeMfeReport;
@@ -11,6 +13,7 @@ use crate::montecarlo::MonteCarloReport;
 use crate::pbo::PboReport;
 use crate::sensitivity::SensitivityReport;
 use crate::shadow::ShadowSummary;
+use crate::snooping::SnoopReport;
 use crate::walkforward::WalkForwardReport;
 use std::collections::BTreeMap;
 
@@ -91,6 +94,7 @@ pub struct ResearchInput {
     pub cpcv_p25_oos: f64,
     pub cpcv_p75_oos: f64,
     pub pbo: Option<PboReport>,
+    pub snooping: Option<SnoopReport>,
     pub sensitivity: Vec<SensitivityReport>,
     pub cost_stress: Vec<CostStressRow>,
     pub cost_verdict: String,
@@ -136,7 +140,16 @@ pub fn report_json(r: &ResearchInput) -> String {
         "\"backtest\":{{\"total_return\":{:.6},\"cagr\":{:.6},\"sharpe\":{:.4},\"sortino\":{:.4},\"calmar\":{:.4},\"max_drawdown\":{:.6},\"expectancy\":{:.6},\"trades\":{}}},",
         m.total_return, m.cagr, m.sharpe, m.sortino, m.calmar, m.max_drawdown, m.expectancy, m.num_trades
     ));
-    o.push_str("\"data_snooping\":{\"whites_reality_check\":\"NOT IMPLEMENTED\",\"hansen_spa\":\"NOT IMPLEMENTED\",\"reason\":\"insufficient statistical assumptions / data requirements for reliable bootstrap null distributions at this sample size; reported honestly instead of faked\"},");
+    if let Some(s) = &r.snooping {
+        o.push_str(&format!(
+            "\"data_snooping\":{{\"rules\":{},\"periods\":{},\"boot_sims\":{},\"mean_block\":{},\"best_rule\":{},\"best_mean\":{:.6},\"white_stat\":{:.4},\"white_p\":{:.4},\"spa_stat\":{:.4},\"spa_p_lower\":{:.4},\"spa_p_consistent\":{:.4},\"spa_p_upper\":{:.4},\"assessment\":{}}},",
+            s.rules, s.periods, s.boot_sims, s.mean_block, s.best_rule, s.best_mean,
+            s.white_stat, s.white_p, s.spa_stat, s.spa_p_lower, s.spa_p_consistent, s.spa_p_upper,
+            jestr(s.assessment)
+        ));
+    } else {
+        o.push_str("\"data_snooping\":{\"status\":\"INSUFFICIENT DATA\",\"reason\":\"OOS matrix too thin for White/SPA asymptotics (need >=10 OOS periods); refused to fabricate a pass\"},");
+    }
     if let Some(p) = &r.pbo {
         o.push_str(&format!(
             "\"overfitting\":{{\"configs_tested\":{},\"pbo\":{:.4},\"degradation\":{:.4},\"assessment\":{}}},",
@@ -266,8 +279,17 @@ pub fn report_markdown(r: &ResearchInput) -> String {
             mc.boot_sharpe.p5,
         ));
     }
-    o.push_str(&format!("## 11. CPCV\n- Paths: {} | Runs scored: {} | Median OOS return: {:.4}% (p25 {:.4}% / p75 {:.4}%)\n", r.cpcv_paths, r.cpcv_runs_scored, r.cpcv_median_oos * 100.0, r.cpcv_p25_oos * 100.0, r.cpcv_p75_oos * 100.0));
-    o.push_str("- White's Reality Check: NOT IMPLEMENTED. Hansen SPA: NOT IMPLEMENTED.\n- Reason: insufficient statistical assumptions / data requirements — reported honestly, never faked.\n\n");
+    o.push_str(&format!("## 11. CPCV + Data Snooping\n- Paths: {} | Runs scored: {} | Median OOS return: {:.4}% (p25 {:.4}% / p75 {:.4}%)\n", r.cpcv_paths, r.cpcv_runs_scored, r.cpcv_median_oos * 100.0, r.cpcv_p25_oos * 100.0, r.cpcv_p75_oos * 100.0));
+    match &r.snooping {
+        Some(s) => o.push_str(&format!(
+            "- White RC over {} rules x {} periods ({} sims, block {}): stat {:.3}, p = {:.4}\n- Hansen SPA (studentized, re-centered): stat {:.3}, p_lower {:.4} / p_consistent {:.4} / p_upper {:.4} — decision uses p_consistent\n- Best rule #{} (mean OOS {:.4}%/period). Assessment: {}\n- NOTE: CPCV windows overlap across paths, so these p-values are approximate — one confirmation among three (WF + PBO + snooping), not proof.\n\n",
+            s.rules, s.periods, s.boot_sims, s.mean_block,
+            s.white_stat, s.white_p, s.spa_stat,
+            s.spa_p_lower, s.spa_p_consistent, s.spa_p_upper,
+            s.best_rule, s.best_mean * 100.0, s.assessment
+        )),
+        None => o.push_str("- White's Reality Check / Hansen SPA: INSUFFICIENT DATA (OOS matrix too thin for the asymptotics) — refused to fabricate a pass.\n\n"),
+    }
     if let Some(p) = &r.pbo {
         o.push_str("## 12. PBO / Overfitting\n");
         o.push_str(&format!(
@@ -339,11 +361,11 @@ mod tests {
         };
         let j = report_json(&r);
         assert!(j.starts_with('{') && j.ends_with('}'));
-        assert!(j.contains("NOT IMPLEMENTED"));
+        assert!(j.contains("INSUFFICIENT DATA")); // no snoop evidence → honest, not faked
         assert!(j.contains("\"strategy\":\"demo\""));
         let md = report_markdown(&r);
         assert!(md.contains("# Strategy Research Report: demo"));
-        assert!(md.contains("never faked"));
+        assert!(md.contains("refused to fabricate"));
     }
 
     #[test]

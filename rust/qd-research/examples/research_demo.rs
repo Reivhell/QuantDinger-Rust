@@ -14,7 +14,7 @@
 
 use qd_research::backtest::{run_backtest, ExecConfig};
 use qd_research::costs::{cost_stress, execution_sensitivity};
-use qd_research::cpcv::{cpcv_splits, score_cpcv_paths};
+use qd_research::cpcv::{contiguous_runs, cpcv_splits, score_cpcv_paths};
 use qd_research::data::{load_bars_csv, synthetic_bars};
 use qd_research::mae_mfe::analyze_mae_mfe;
 use qd_research::metrics::compute_metrics;
@@ -249,9 +249,55 @@ fn main() {
         oos_m.push(oos_row);
     }
     let pbo = analyze_overfitting(
-        &ScoreMatrix { configs: cfgs, is: is_m, oos: oos_m },
+        &ScoreMatrix { configs: cfgs, is: is_m, oos: oos_m.clone() },
         &PboBands::default(),
     );
+
+    // Data snooping (§7 luck adjustment): White RC + Hansen SPA over the
+    // grid scored on every CPCV run (K configs × R runs, vs cash). Each run
+    // is a contiguous flat-to-flat OOS window with the <3-trade floor, so
+    // T = R ≈ 23 clears the min_periods=10 bar where the 2 WF folds cannot.
+    // Thin grids still return None (fail-closed) — never faked.
+    let snoop_runs: Vec<(usize, usize)> = splits
+        .iter()
+        .filter(|s| !s.train.is_empty())
+        .flat_map(|s| contiguous_runs(&s.test, 50))
+        .collect();
+    let mut snoop_m: Vec<Vec<f64>> = Vec::with_capacity(grid.len());
+    for (_, build) in &grid {
+        let sg = build(&bars, &closes, &regimes);
+        let mut row = Vec::with_capacity(snoop_runs.len());
+        for (lo, hi) in &snoop_runs {
+            let r = run_backtest(
+                &bars[*lo..*hi],
+                &sg[*lo..*hi],
+                &regimes[*lo..*hi],
+                &feature_ids[*lo..*hi],
+                &exec,
+                100_000.0,
+                |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
+            );
+            let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
+            row.push(if m.num_trades >= 3 { m.total_return } else { 0.0 });
+        }
+        snoop_m.push(row);
+    }
+    let snoop_cfg = qd_research::snooping::SnoopConfig {
+        boot_sims: cfg.snoop_sims,
+        seed: cfg.snoop_seed,
+        mean_block: cfg.snoop_block,
+        ..qd_research::snooping::SnoopConfig::default()
+    };
+    let snoop = qd_research::snooping::data_snoop(&snoop_m, &snoop_cfg);
+    match &snoop {
+        Some(s) => println!(
+            "snooping [{} rules x {} periods, {} sims]: White stat {:.3} p={:.4} | SPA stat {:.3} p_consistent={:.4} (lower {:.4} / upper {:.4}) — {}",
+            s.rules, s.periods, s.boot_sims,
+            s.white_stat, s.white_p, s.spa_stat,
+            s.spa_p_consistent, s.spa_p_lower, s.spa_p_upper, s.assessment
+        ),
+        None => println!("snooping: INSUFFICIENT DATA (OOS matrix too thin) — no p-values fabricated"),
+    }
 
     // Sensitivity around the configured knob (full-sample robust return —
     // total return with the same <3-trade floor, so thin windows score 0
@@ -430,6 +476,7 @@ fn main() {
         stop_on_every_trade: cfg.stop_loss > 0.0,
         leverage_ok: qd_research::risk::liquidation_ok(cfg.leverage, cfg.stop_loss, 3.0),
         killswitch_verified: true, // shadow runs under the live kill-switch
+        snooping: snoop.clone(),
         shadow: Some((&shadow).into()),
     };
 
@@ -521,6 +568,7 @@ fn main() {
         cpcv_p25_oos: cpcv_summary.p25,
         cpcv_p75_oos: cpcv_summary.p75,
         pbo: Some(pbo),
+        snooping: snoop,
         sensitivity: vec![sens],
         cost_stress: cs,
         shadow: Some(shadow),

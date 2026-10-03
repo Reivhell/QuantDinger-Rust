@@ -189,6 +189,7 @@ fn main() {
         stop_on_every_trade: cfg.stop_loss > 0.0 && dd_ok,
         leverage_ok: lev_ok,
         killswitch_verified: true, // KS watched the full equity curve above
+        snooping: None, // not run in this demo → fails closed
         shadow: None, // no holdout in this demo → fails closed
     });
     println!(

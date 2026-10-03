@@ -292,6 +292,21 @@ impl AuditTrail {
         self.records.push(r);
     }
 
+    /// One-line rejection: issue an id, append the audit record, hand back
+    /// the reason for `return Err(...)`. Every early exit in [`validate`]
+    /// goes through here — 7 call sites, one shape.
+    pub fn reject(
+        &mut self,
+        raw: &RawDecision,
+        state: DecisionState,
+        reason: RejectReason,
+        lines: &[ScoreLine],
+    ) -> RejectReason {
+        let id = self.issue_id();
+        self.record(reject_record(id, raw, state, reason, lines));
+        reason
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }
@@ -376,9 +391,7 @@ pub fn validate(
         || !(0.0..=1.0).contains(&raw.confidence)
         || raw.expiry <= raw.timestamp
     {
-        let id = audit.issue_id();
-        audit.record(reject_record(id, raw, DecisionState::InvalidDecision, RejectReason::InvalidSchema, &[]));
-        return Err(RejectReason::InvalidSchema);
+        return Err(audit.reject(raw, DecisionState::InvalidDecision, RejectReason::InvalidSchema, &[]));
     }
     // HOLD / NO_TRADE are idle by construction — not failures, not trades,
     // not audit entries. Only real BUY/SELL proposals enter the trail.
@@ -387,28 +400,20 @@ pub fn validate(
     }
     // §8 expiry + staleness before any other work: stale reasoning is dead.
     if world.now > raw.expiry {
-        let id = audit.issue_id();
-        audit.record(reject_record(id, raw, DecisionState::Expired, RejectReason::Expired, &[]));
-        return Err(RejectReason::Expired);
+        return Err(audit.reject(raw, DecisionState::Expired, RejectReason::Expired, &[]));
     }
     if !world.data_fresh || world.now - raw.timestamp > contract.max_data_age_bars {
-        let id = audit.issue_id();
-        audit.record(reject_record(id, raw, DecisionState::RejectedData, RejectReason::StaleData, &[]));
-        return Err(RejectReason::StaleData);
+        return Err(audit.reject(raw, DecisionState::RejectedData, RejectReason::StaleData, &[]));
     }
     if !world.state_known {
-        let id = audit.issue_id();
-        audit.record(reject_record(id, raw, DecisionState::RejectedData, RejectReason::StaleData, &[]));
-        return Err(RejectReason::StaleData);
+        return Err(audit.reject(raw, DecisionState::RejectedData, RejectReason::StaleData, &[]));
     }
 
     // RISK veto before evidence (§12: SAFETY > RISK > DATA > EXECUTION >
     // STRATEGY > LLM). A halted risk engine rejects even a fully-evidenced
     // proposal — evidence never outranks a halt.
     if !world.risk_ok {
-        let id = audit.issue_id();
-        audit.record(reject_record(id, raw, DecisionState::RejectedRisk, RejectReason::RiskHalted, &[]));
-        return Err(RejectReason::RiskHalted);
+        return Err(audit.reject(raw, DecisionState::RejectedRisk, RejectReason::RiskHalted, &[]));
     }
 
     // §7 scorecard: every mandatory line must PASS. Confidence appears
@@ -449,9 +454,7 @@ pub fn validate(
             RejectReason::ExecutionUnhealthy => DecisionState::RejectedExecution,
             _ => DecisionState::RejectedRisk,
         };
-        let id = audit.issue_id();
-        audit.record(reject_record(id, raw, state, reason, &scorecard.lines));
-        return Err(reason);
+        return Err(audit.reject(raw, state, reason, &scorecard.lines));
     }
 
     // Walk the legal state path explicitly (§2): a shortcut (e.g.
@@ -465,9 +468,7 @@ pub fn validate(
         DecisionState::Validated,
     ] {
         s = transition(s, next).map_err(|e| {
-            let id = audit.issue_id();
-            audit.record(reject_record(id, raw, DecisionState::InvalidDecision, e, &scorecard.lines));
-            e
+            audit.reject(raw, DecisionState::InvalidDecision, e, &scorecard.lines)
         })?;
     }
 

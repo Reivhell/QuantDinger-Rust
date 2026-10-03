@@ -19,13 +19,12 @@ use qd_research::costs::{cost_stress, execution_sensitivity};
 use qd_research::cpcv::{contiguous_runs, cpcv_splits, score_cpcv_paths};
 use qd_research::features::Bar;
 use qd_research::mae_mfe::analyze_mae_mfe;
-use qd_research::metrics::compute_metrics;
 use qd_research::montecarlo::run_monte_carlo;
 use qd_research::pbo::{analyze_overfitting, PboBands, ScoreMatrix};
 use qd_research::regime::{detect, Regime, RegimeConfig};
 use qd_research::report::{regime_slices, report_json, report_markdown, ResearchInput};
 use qd_research::run::{
-    self, family_of, StrategyFam, PERIODS_PER_YEAR, STARTING_EQUITY,
+    self, family_of, StrategyFam, STARTING_EQUITY,
 };
 use qd_research::sensitivity::{analyze_sensitivity, ParamPoint};
 use qd_research::strategies::{DonchianBreakout, EmaCrossTrend, RsiMeanReversion};
@@ -65,22 +64,12 @@ fn main() {
     // All share the same pipeline below — only the signal source differs.
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
     let fam = family_of(&cfg.strategy_name);
-    let use_rsi = fam == StrategyFam::Rsi;
     let signals = run::build_signals(fam, &cfg, &bars, &closes, &regimes);
     let wf_label = run::fold_label(fam, &cfg);
     let feature_ids = vec![1u64; n];
     let exec = run::exec_of(&cfg);
-    let res = qd_research::backtest::run_backtest(
-        &bars,
-        &signals,
-        &regimes,
-        &feature_ids,
-        &exec,
-        STARTING_EQUITY,
-        |px, eq| run::fixed_qty(px, eq, &cfg),
-    );
-    let metrics =
-        compute_metrics(&res.trades, &res.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
+    let (res, metrics) =
+        run::backtest_scored(&bars, &signals, &regimes, &feature_ids, &exec, &cfg);
     let mae = analyze_mae_mfe(&res.trades);
     let rets: Vec<f64> =
         res.trades.iter().map(|t| t.net_pnl / STARTING_EQUITY).collect();
@@ -90,13 +79,14 @@ fn main() {
     let mut outcomes = Vec::new();
     for (k, f) in folds.iter().enumerate() {
         let sub = &bars[f.oos_start..f.oos_end];
-        let sub_sig = &signals[f.oos_start..f.oos_end];
-        let sub_reg = &regimes[f.oos_start..f.oos_end];
-        let sub_fid = &feature_ids[f.oos_start..f.oos_end];
-        let r = qd_research::backtest::run_backtest(sub, sub_sig, sub_reg, sub_fid, &exec, STARTING_EQUITY, |px, eq| {
-            run::fixed_qty(px, eq, &cfg)
-        });
-        let m = compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
+        let m = run::backtest_scored(
+            sub,
+            &signals[f.oos_start..f.oos_end],
+            &regimes[f.oos_start..f.oos_end],
+            &feature_ids[f.oos_start..f.oos_end],
+            &exec,
+            &cfg,
+        ).1;
         outcomes.push(FoldOutcome {
             fold: k,
             selected_config: wf_label.clone(),
@@ -117,16 +107,7 @@ fn main() {
     // each run starts with no position.
     let splits = cpcv_splits(n, cfg.cpcv_partitions, cfg.cpcv_test, 5, 2);
     let cpcv_scores = score_cpcv_paths(&splits, 50, |lo, hi| {
-        let r = qd_research::backtest::run_backtest(
-            &bars[lo..hi],
-            &signals[lo..hi],
-            &regimes[lo..hi],
-            &feature_ids[lo..hi],
-            &exec,
-            STARTING_EQUITY,
-            |px, eq| run::fixed_qty(px, eq, &cfg),
-        );
-        compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR).total_return
+        run::backtest_scored(&bars[lo..hi], &signals[lo..hi], &regimes[lo..hi], &feature_ids[lo..hi], &exec, &cfg).1.total_return
     });
     let cpcv_summary = qd_research::montecarlo::summarize(cpcv_scores);
 
@@ -153,7 +134,7 @@ fn main() {
             }
         }
         g
-    } else if use_rsi {
+    } else if fam == StrategyFam::Rsi {
         let mut g: Vec<(String, Box<SigFn>)> = Vec::new();
         for p in [7usize, 14, 21] {
             for os in [25.0f64, 30.0, 35.0] {
@@ -192,17 +173,9 @@ fn main() {
         for f in build_folds(n, cfg.wf_train, cfg.wf_oos, cfg.wf_step, false) {
             let sg = build(&bars, &closes, &regimes);
             for (lo, hi) in [(f.is_start, f.is_end), (f.oos_start, f.oos_end)] {
-                let r = qd_research::backtest::run_backtest(
-                    &bars[lo..hi],
-                    &sg[lo..hi],
-                    &regimes[lo..hi],
-                    &feature_ids[lo..hi],
-                    &exec,
-                    STARTING_EQUITY,
-                    |px, eq| run::fixed_qty(px, eq, &cfg),
-                );
-                let m =
-                    compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
+                let m = run::backtest_scored(
+                    &bars[lo..hi], &sg[lo..hi], &regimes[lo..hi], &feature_ids[lo..hi], &exec, &cfg,
+                ).1;
                 let robust = run::robust_cagr(m.num_trades, m.cagr);
                 if hi == f.is_end {
                     is_row.push(robust);
@@ -234,17 +207,9 @@ fn main() {
         let sg = build(&bars, &closes, &regimes);
         let mut row = Vec::with_capacity(snoop_runs.len());
         for (lo, hi) in &snoop_runs {
-            let r = qd_research::backtest::run_backtest(
-                &bars[*lo..*hi],
-                &sg[*lo..*hi],
-                &regimes[*lo..*hi],
-                &feature_ids[*lo..*hi],
-                &exec,
-                STARTING_EQUITY,
-                |px, eq| run::fixed_qty(px, eq, &cfg),
-            );
-            let m =
-                compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
+            let m = run::backtest_scored(
+                &bars[*lo..*hi], &sg[*lo..*hi], &regimes[*lo..*hi], &feature_ids[*lo..*hi], &exec, &cfg,
+            ).1;
             row.push(run::robust_cagr(m.num_trades, m.cagr));
         }
         snoop_m.push(row);
@@ -271,7 +236,7 @@ fn main() {
     // Plateau = robust.
     let (sens_name, sens_base, sens_vals): (&str, f64, Vec<f64>) = if fam == StrategyFam::Donchian {
         ("donchian_lookback", cfg.donchian_lookback as f64, vec![10.0, 15.0, 20.0, 25.0, 30.0])
-    } else if use_rsi {
+    } else if fam == StrategyFam::Rsi {
         ("rsi_period", cfg.rsi_period as f64, vec![7.0, 10.0, 14.0, 18.0, 21.0])
     } else {
         let d: [i64; 4] = [-2, -1, 1, 2];
@@ -287,7 +252,7 @@ fn main() {
                 relvol_min: cfg.donchian_relvol,
             }
             .signals(&bars, &regimes)
-        } else if use_rsi {
+        } else if fam == StrategyFam::Rsi {
             RsiMeanReversion {
                 period: (val as usize).max(2),
                 oversold: cfg.rsi_oversold,
@@ -299,13 +264,10 @@ fn main() {
             EmaCrossTrend { fast: (val as usize).max(2), slow: cfg.ema_slow }
                 .signals(&closes, &regimes)
         };
-        let r = qd_research::backtest::run_backtest(&bars, &sg, &regimes, &feature_ids, &exec, STARTING_EQUITY, |px, eq| {
-            run::fixed_qty(px, eq, &cfg)
-        });
-        let m = compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
         // Full-sample window is identical for every knob value, so total
         // return and CAGR rank identically — use CAGR for consistency with
         // the PBO/snooping grids. 0 trades → 0.0 (flat, no evidence).
+        let m = run::backtest_scored(&bars, &sg, &regimes, &feature_ids, &exec, &cfg).1;
         run::robust_cagr(m.num_trades, m.cagr)
     };
     let sweep: Vec<ParamPoint> = sens_vals

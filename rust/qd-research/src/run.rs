@@ -12,9 +12,10 @@
 //! I/O except reading the CSV path the caller hands it (`load_bars`), never
 //! touches the network/DB, and reports evidence the brain decides on.
 
-use crate::backtest::{ExecConfig, Signal};
+use crate::backtest::{run_backtest, BacktestResult, ExecConfig, Signal};
 use crate::config::ResearchConfig;
 use crate::features::Bar;
+use crate::metrics::{compute_metrics, Metrics};
 use crate::regime::Regime;
 use crate::shadow::ShadowConfig;
 use crate::strategies::{DonchianBreakout, EmaCrossTrend, RsiMeanReversion};
@@ -197,6 +198,24 @@ pub fn leverage_ok(cfg: &ResearchConfig) -> bool {
 /// capped at [`MAX_POSITION_NOTIONAL`].
 pub fn fixed_qty(price: f64, equity: f64, cfg: &ResearchConfig) -> f64 {
     crate::risk::fixed_fractional_qty(price, equity, cfg.risk_fraction, cfg.stop_loss, MAX_POSITION_NOTIONAL)
+}
+
+/// One backtest + metrics pass on a slice with the shared sizer: the unit
+/// `research_run` repeats on full sample, WF-OOS folds, CPCV, PBO, snooping,
+/// and sensitivity windows. Returns `(result, metrics)`.
+pub fn backtest_scored(
+    bars: &[Bar],
+    signals: &[Signal],
+    regimes: &[Regime],
+    feature_ids: &[u64],
+    exec: &ExecConfig,
+    cfg: &ResearchConfig,
+) -> (BacktestResult, Metrics) {
+    let r = run_backtest(bars, signals, regimes, feature_ids, exec, STARTING_EQUITY, |px, eq| {
+        fixed_qty(px, eq, cfg)
+    });
+    let m = compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
+    (r, m)
 }
 
 /// Regimes where new entries are forbidden (caller policy, §5): chop,

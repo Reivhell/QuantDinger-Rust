@@ -64,10 +64,6 @@ impl JsonVal {
     }
 }
 
-fn dump_str(s: &str) -> String {
-    dump_str_inner(s, false)
-}
-
 fn dump_str_inner(s: &str, raw_utf8: bool) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

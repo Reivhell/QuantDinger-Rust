@@ -293,11 +293,12 @@ pub fn report_markdown(r: &ResearchInput) -> String {
     if let Some(p) = &r.pbo {
         o.push_str("## 12. PBO / Overfitting\n");
         o.push_str(&format!(
-            "- Configs tested: {} (all tracked, failures included) | Best IS: {:.3} | Median IS: {:.3} | Median OOS of IS-best: {:.3}\n- Degradation: {} | Assessment: {}\n\n",
+            "- Configs tested: {} (all tracked, failures included) | Best IS: {:.3} | Median IS: {:.3} | Median OOS of IS-best: {:.3} | Median OOS overall: {:.3}\n- Degradation: {} | Assessment: {}\n\n",
             p.configs_tested,
             p.best_is,
             p.median_is,
             p.median_oos_of_is_best,
+            p.median_oos_overall,
             pct(p.degradation),
             p.assessment
         ));

@@ -88,11 +88,17 @@ impl RsiMeanReversion {
 
 /// Donchian breakout, long-only (spot-first, §2): long when the close
 /// escapes the prior `lookback`-bar close-channel high with relative volume
-/// ≥ `relvol_min`. Gated to BREAKOUT only — TRANSITION was measured at
-/// −0.25%/trade over 9 trades on ETH-USDT daily 2k (vs +1.58%/trade over 8
-/// in BREAKOUT): the classifier's uncertain state dilutes the edge, so the
-/// signal stays out of it. Never chases in trends (late), ranges
-/// (fakeouts), volatility extremes (stops misbehave), or garbage. The
+/// ≥ `relvol_min`. Gated to BREAKOUT only. History: TRANSITION was
+/// admitted until a fill-bar attribution bug was found (entry_regime was
+/// read at the fill bar, i+latency, not the signal bar — BREAKOUT is
+/// transient, so BREAKOUT signals filled a bar later were mislabeled
+/// TRANSITION, fabricating a −0.25%/trade TRANSITION cell). After the fix
+/// (attribute to the signal bar) re-admitting TRANSITION adds zero trades
+/// on ETH-USDT daily 2k — all Donchian signals already fire in BREAKOUT.
+/// The BREAKOUT-only gate is therefore a no-op on current data, kept as
+/// defense in depth: the classifier's uncertain state should not authorize
+/// entries. Never chases in trends (late), ranges (fakeouts), volatility
+/// extremes (stops misbehave), or garbage. The
 /// channel is strictly prior bars (`< i`, never including `i`); warmup
 /// (`i < lookback`) is Flat. Volume re-checked here even though the
 /// BREAKOUT regime already requires participation — defense in depth.

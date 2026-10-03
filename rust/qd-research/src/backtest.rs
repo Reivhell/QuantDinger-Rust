@@ -137,10 +137,14 @@ pub fn run_backtest(
     let mut equity_curve = Vec::with_capacity(n);
     let mut trades: Vec<Trade> = Vec::new();
     let mut open: Option<OpenPosition> = None;
-    // pending entries: (fill_idx, direction, feature_id, forced_qty).
+    // pending entries: (fill_idx, direction, feature_id, forced_qty, sig_idx).
     // forced_qty is Some only for partial-fill top-ups, which must NOT be
-    // re-sized (re-running the sizer would overfill).
-    let mut pending: Vec<(usize, i8, u64, Option<f64>)> = Vec::new();
+    // re-sized (re-running the sizer would overfill). sig_idx is the bar the
+    // signal fired on — entry_regime is attributed to the signal bar, not
+    // the fill bar: with latency >= 1 the fill lands a bar later, often in
+    // whatever regime follows the signal (BREAKOUT is transient), so
+    // fill-bar attribution would systematically mislabel signal filters.
+    let mut pending: Vec<(usize, i8, u64, Option<f64>, usize)> = Vec::new();
 
     for i in 0..n {
         let bar = &bars[i];
@@ -167,13 +171,13 @@ pub fn run_backtest(
         }
         // 2. Process pending entries due on this bar. Flat-exit orders
         // (direction 0) are NOT consumed here — step 4 handles them.
-        let due: Vec<(i8, u64, Option<f64>)> = pending
+        let due: Vec<(i8, u64, Option<f64>, usize)> = pending
             .iter()
-            .filter(|(idx, d, _, _)| *idx == i && *d != 0)
-            .map(|(_, d, f, q)| (*d, *f, *q))
+            .filter(|(idx, d, _, _, _)| *idx == i && *d != 0)
+            .map(|(_, d, f, q, s)| (*d, *f, *q, *s))
             .collect();
-        pending.retain(|(idx, d, _, _)| !(*idx == i && *d != 0));
-        for (dir, fid, forced) in due {
+        pending.retain(|(idx, d, _, _, _)| !(*idx == i && *d != 0));
+        for (dir, fid, forced, sig) in due {
             // Opposing pending entry closes an open position first.
             if let Some(mut pos) = open.take() {
                 if pos.direction != dir {
@@ -226,14 +230,14 @@ pub fn run_backtest(
                         entry_price: px,
                         direction: dir,
                         quantity: fill_qty,
-                        entry_regime: regimes.get(i).copied().unwrap_or(Regime::Transition),
+                        entry_regime: regimes.get(sig).copied().unwrap_or(Regime::Transition),
                         feature_id: fid,
                         best: px,
                         worst: px,
                         trail_level: None,
                     });
                     if qty - fill_qty > 0.0 {
-                        pending.push((i + 1, dir, fid, Some(qty - fill_qty)));
+                        pending.push((i + 1, dir, fid, Some(qty - fill_qty), sig));
                     }
                 }
             }
@@ -249,17 +253,17 @@ pub fn run_backtest(
             if want == 0 {
                 if open.is_some() {
                     // Close at next bar open (no look-ahead: schedule it).
-                    pending.push((i + latency, 0, 0, None));
+                    pending.push((i + latency, 0, 0, None, i));
                 }
             } else if want != cur {
-                pending.push((i + latency, want, feature_ids.get(i).copied().unwrap_or(0), None));
+                pending.push((i + latency, want, feature_ids.get(i).copied().unwrap_or(0), None, i));
             }
             // Flat-exit orders (dir == 0) are handled below in pending processing.
         }
         // 4. Flat-exit orders due now.
-        let flat_due = pending.iter().any(|(idx, d, _, _)| *idx == i && *d == 0);
+        let flat_due = pending.iter().any(|(idx, d, _, _, _)| *idx == i && *d == 0);
         if flat_due {
-            pending.retain(|(idx, d, _, _)| !(*idx == i && *d == 0));
+            pending.retain(|(idx, d, _, _, _)| !(*idx == i && *d == 0));
             if let Some(pos) = open.take() {
                 let px = market_fill_price(bar.open, pos.direction, cfg);
                 close_position(
@@ -570,5 +574,24 @@ mod tests {
         assert_eq!(t.feature_id, 7);
         assert!(t.mfe >= 0.0 && t.holding_bars >= 1);
         assert_eq!(res.equity_curve.len(), 4);
+    }
+
+    #[test]
+    fn entry_regime_attributed_to_signal_bar_not_fill_bar() {
+        // Signal fires on bar 0 (BREAKOUT), fills on bar 1 (TRANSITION,
+        // latency 1). The trade must carry the regime the signal DECIDED
+        // on — BREAKOUT is transient, and fill-bar attribution mislabeled
+        // every regime-gated strategy's reports.
+        let b = bars(&[100.0, 102.0, 104.0, 103.0]);
+        let sig = vec![Signal::Long, Signal::Flat, Signal::Flat, Signal::Flat];
+        let reg = vec![
+            Regime::Breakout,
+            Regime::Transition,
+            Regime::Transition,
+            Regime::Transition,
+        ];
+        let res = run_backtest(&b, &sig, &reg, &[0; 4], &ExecConfig::default(), 10_000.0, |_, _| 2.0);
+        assert_eq!(res.trades.len(), 1);
+        assert_eq!(res.trades[0].entry_regime, Regime::Breakout);
     }
 }

@@ -151,6 +151,11 @@ pub fn price_distance_from_ema(closes: &[f64], ema_series: &[Option<f64>]) -> Ve
 /// Session-anchored VWAP: `cum(typical*volume) / cum(volume)`, reset at
 /// each `session[i] != session[i-1]` boundary. Zero-volume bars reuse the
 /// previous value (no division by zero). O(n).
+///
+/// NOTE: on multi-day/multi-month series passed with a single session id
+/// this accumulates over the whole history and drifts far from price — it
+/// is an intraday (per-session) measure. For regime classification over
+/// daily bars use [`vwap_rolling`] instead.
 pub fn vwap(bars: &[Bar], session: &[i64]) -> Vec<Option<f64>> {
     let n = bars.len();
     let mut out = vec![None; n];
@@ -171,6 +176,41 @@ pub fn vwap(bars: &[Bar], session: &[i64]) -> Vec<Option<f64>> {
             _ => {
                 out[i] = if vv > 0.0 { Some(pv / vv) } else { None };
             }
+        }
+    }
+    out
+}
+
+/// Rolling VWAP: `sum(typical*volume) / sum(volume)` over the trailing
+/// `period` bars (inclusive, causal). `None` until `period` bars exist or
+/// the window's volume sums to ≤ 0. This is the regime-classifier anchor:
+/// unlike session VWAP it stays near price on multi-day series, so
+/// `|close - vwap|/vwap` and `|close - vwap|/atr` measure *current*
+/// extension from value, not drift from a months-old open. O(n·period).
+pub fn vwap_rolling(bars: &[Bar], period: usize) -> Vec<Option<f64>> {
+    let n = bars.len();
+    let mut out = vec![None; n];
+    if period == 0 || n < period {
+        return out;
+    }
+    for i in (period - 1)..n {
+        let mut pv = 0.0;
+        let mut vv = 0.0;
+        let mut ok = true;
+        for b in &bars[(i + 1 - period)..=i] {
+            match typical_price(b) {
+                Some(tp) if b.volume > 0.0 && tp.is_finite() && b.volume.is_finite() => {
+                    pv += tp * b.volume;
+                    vv += b.volume;
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && vv > 0.0 {
+            out[i] = Some(pv / vv);
         }
     }
     out
@@ -958,5 +998,23 @@ mod tests {
         ];
         let v = vwap(&bars, &[1, 2]); // new session → reset
         assert_eq!(v[1], Some(20.0));
+    }
+
+    #[test]
+    fn vwap_rolling_tracks_price() {
+        // Flat 100s then a jump: rolling VWAP(3) follows within a bar,
+        // session VWAP over the whole run would lag far behind.
+        let bars: Vec<Bar> = (0..6)
+            .map(|i| {
+                let c = if i < 3 { 100.0 } else { 110.0 };
+                Bar { t: i, open: c, high: c, low: c, close: c, volume: 100.0 }
+            })
+            .collect();
+        let v = vwap_rolling(&bars, 3);
+        assert!(v[1].is_none()); // warmup
+        assert_eq!(v[2], Some(100.0));
+        assert!((v[4].unwrap() - 106.666).abs() < 0.01);
+        assert_eq!(v[5], Some(110.0));
+        assert!(vwap_rolling(&bars, 0).iter().all(|x| x.is_none()));
     }
 }

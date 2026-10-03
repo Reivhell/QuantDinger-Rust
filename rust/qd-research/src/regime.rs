@@ -67,6 +67,10 @@ impl Regime {
 ///   AND directionless. Above it, the move is a trend, not a stretch.
 /// - `abnormal_range_atr_mult = 6.0`: a single bar spanning ≥6 ATR is a data
 ///   error, flash crash, or halt-reopen — integrity uncertain, fail safe.
+/// - `vwap_period = 20`: rolling value anchor ≈ one trading month (daily
+///   bars). Session VWAP drifts months away from price on multi-day series
+///   (RANGING then reads 0.3% of bars); the trailing-20 anchor keeps
+///   `|close-vwap|` a current extension-from-value measure.
 #[derive(Debug, Clone)]
 pub struct RegimeConfig {
     pub adx_period: usize,
@@ -87,6 +91,7 @@ pub struct RegimeConfig {
     pub mr_dev_atr: f64,
     pub meanrev_adx_max: f64,
     pub abnormal_range_atr_mult: f64,
+    pub vwap_period: usize,
 }
 
 impl Default for RegimeConfig {
@@ -110,6 +115,7 @@ impl Default for RegimeConfig {
             mr_dev_atr: 2.0,
             meanrev_adx_max: 20.0,
             abnormal_range_atr_mult: 6.0,
+            vwap_period: 20,
         }
     }
 }
@@ -401,7 +407,7 @@ fn classify_bar(
 /// Volatility regime uses ATR *relative to price* (`atr / close`), not raw
 /// ATR: a constant-spread ramp has flat absolute ATR while its economic
 /// volatility decays, and must not read as HIGH_VOLATILITY late in the move.
-pub fn detect(bars: &[Bar], session: &[i64], cfg: &RegimeConfig) -> Vec<Regime> {
+pub fn detect(bars: &[Bar], _session: &[i64], cfg: &RegimeConfig) -> Vec<Regime> {
     use crate::features as f;
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
     let (adx_v, pdi, mdi) = adx(bars, cfg.adx_period);
@@ -417,7 +423,10 @@ pub fn detect(bars: &[Bar], session: &[i64], cfg: &RegimeConfig) -> Vec<Regime> 
         })
         .collect();
     let atr_pct = rolling_percentile(&atr_pct_price, cfg.atr_window);
-    let vw = f::vwap(bars, session);
+    // Rolling (trailing-`vwap_period`) value anchor: session VWAP drifts
+    // months from price on daily series; the RANGING / MEAN_REVERSION rules
+    // need a *current* extension-from-value, so they read this, not it.
+    let vw = f::vwap_rolling(bars, cfg.vwap_period);
     let volumes: Vec<f64> = bars.iter().map(|b| b.volume).collect();
     let rv = relative_volume(&volumes, cfg.vol_period);
     classify(bars, cfg, &adx_v, &pdi, &mdi, &ef, &es, &atr_pct, &vw, &atr_v, &rv)

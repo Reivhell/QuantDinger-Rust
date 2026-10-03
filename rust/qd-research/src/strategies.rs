@@ -88,11 +88,14 @@ impl RsiMeanReversion {
 
 /// Donchian breakout, long-only (spot-first, §2): long when the close
 /// escapes the prior `lookback`-bar close-channel high with relative volume
-/// ≥ `relvol_min`. Gated to BREAKOUT / TRANSITION only — never chases in
-/// trends (late), ranges (fakeouts), volatility extremes (stops misbehave),
-/// or garbage. The channel is strictly prior bars (`< i`, never including
-/// `i`); warmup (`i < lookback`) is Flat. Volume re-checked here even though
-/// the BREAKOUT regime already requires participation — defense in depth.
+/// ≥ `relvol_min`. Gated to BREAKOUT only — TRANSITION was measured at
+/// −0.25%/trade over 9 trades on ETH-USDT daily 2k (vs +1.58%/trade over 8
+/// in BREAKOUT): the classifier's uncertain state dilutes the edge, so the
+/// signal stays out of it. Never chases in trends (late), ranges
+/// (fakeouts), volatility extremes (stops misbehave), or garbage. The
+/// channel is strictly prior bars (`< i`, never including `i`); warmup
+/// (`i < lookback`) is Flat. Volume re-checked here even though the
+/// BREAKOUT regime already requires participation — defense in depth.
 pub struct DonchianBreakout {
     pub lookback: usize,
     pub relvol_min: f64,
@@ -109,7 +112,7 @@ impl DonchianBreakout {
             .map(|(i, c)| {
                 let reg = regimes.get(i).copied().unwrap_or(Regime::Transition);
                 match reg {
-                    Regime::Breakout | Regime::Transition => {}
+                    Regime::Breakout => {}
                     _ => return Signal::Flat,
                 }
                 if self.lookback == 0 || i < self.lookback {
@@ -233,7 +236,7 @@ mod tests {
     #[test]
     fn donchian_fires_only_on_confirmed_escape() {
         let bars = donchian_bars();
-        let regs = vec![Regime::Transition; bars.len()];
+        let regs = vec![Regime::Breakout; bars.len()];
         let sig = DonchianBreakout { lookback: 20, relvol_min: 1.5 }
             .signals(&bars, &regs);
         // Warmup flat; escape bar 20 fires (close 101 > prior high 100,
@@ -244,7 +247,7 @@ mod tests {
         let mut thin = donchian_bars();
         thin[20].volume = 100.0;
         let sig2 = DonchianBreakout { lookback: 20, relvol_min: 1.5 }
-            .signals(&thin, &vec![Regime::Transition; thin.len()]);
+            .signals(&thin, &vec![Regime::Breakout; thin.len()]);
         assert!(sig2.iter().all(|s| *s == Signal::Flat));
         // Ranging gate forces flat even on a real escape.
         let sig3 = DonchianBreakout { lookback: 20, relvol_min: 1.5 }

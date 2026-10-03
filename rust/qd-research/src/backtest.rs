@@ -67,6 +67,10 @@ pub enum Signal {
 pub struct Trade {
     pub entry_idx: usize,
     pub exit_idx: Option<usize>,
+    /// Caller timestamp of the entry bar (`Bar.t`).
+    pub entry_t: i64,
+    /// Caller timestamp of the exit bar.
+    pub exit_t: Option<i64>,
     pub entry_price: f64,
     pub exit_price: Option<f64>,
     pub direction: i8, // +1 long, -1 short
@@ -95,6 +99,7 @@ impl Trade {
 
 struct OpenPosition {
     entry_idx: usize,
+    entry_t: i64,
     entry_price: f64,
     direction: i8,
     quantity: f64,
@@ -148,6 +153,7 @@ pub fn run_backtest(
                         &mut equity,
                         pos,
                         i,
+                        bar.t,
                         exit_price,
                         reason,
                         regimes.get(i).copied().unwrap_or(Regime::Transition),
@@ -175,6 +181,7 @@ pub fn run_backtest(
                         &mut equity,
                         &pos,
                         i,
+                        bar.t,
                         px,
                         "signal".to_string(),
                         regimes.get(i).copied().unwrap_or(Regime::Transition),
@@ -213,6 +220,7 @@ pub fn run_backtest(
                     };
                     open = Some(OpenPosition {
                         entry_idx: i,
+                        entry_t: bar.t,
                         entry_price: px,
                         direction: dir,
                         quantity: fill_qty,
@@ -257,6 +265,7 @@ pub fn run_backtest(
                     &mut equity,
                     &pos,
                     i,
+                    bar.t,
                     px,
                     "signal".to_string(),
                     regimes.get(i).copied().unwrap_or(Regime::Transition),
@@ -288,6 +297,7 @@ pub fn run_backtest(
             &mut equity,
             &pos,
             last,
+            bars[last].t,
             px,
             "eod".to_string(),
             regimes.get(last).copied().unwrap_or(Regime::Transition),
@@ -363,7 +373,10 @@ fn check_exits(pos: &mut OpenPosition, bar: &Bar, cfg: &ExecConfig) -> Option<St
 }
 
 fn exit_fill_price(pos: &OpenPosition, bar: &Bar, reason: &str, cfg: &ExecConfig) -> f64 {
-    match reason {
+    // Stop/take/trailing levels are theoretical triggers; the fill itself is
+    // a market order and crosses spread + slippage like any other exit.
+    // (EOD exits mark at the last close with no extra cost — documented.)
+    let level = match reason {
         "stop_loss" if cfg.stop_loss > 0.0 => {
             pos.entry_price * (1.0 - pos.direction as f64 * cfg.stop_loss)
         }
@@ -371,8 +384,9 @@ fn exit_fill_price(pos: &OpenPosition, bar: &Bar, reason: &str, cfg: &ExecConfig
             pos.entry_price * (1.0 + pos.direction as f64 * cfg.take_profit)
         }
         "trailing" => pos.trail_level.unwrap_or(bar.close),
-        _ => market_fill_price(bar.open, -pos.direction, cfg),
-    }
+        _ => return market_fill_price(bar.open, -pos.direction, cfg),
+    };
+    market_fill_price(level, -pos.direction, cfg)
 }
 
 fn close_position(
@@ -380,6 +394,7 @@ fn close_position(
     equity: &mut f64,
     pos: &OpenPosition,
     exit_idx: usize,
+    exit_t: i64,
     exit_price: f64,
     reason: String,
     exit_regime: Regime,
@@ -405,6 +420,8 @@ fn close_position(
     trades.push(Trade {
         entry_idx: pos.entry_idx,
         exit_idx: Some(exit_idx),
+        entry_t: pos.entry_t,
+        exit_t: Some(exit_t),
         entry_price: pos.entry_price,
         exit_price: Some(exit_price),
         direction: pos.direction,
@@ -479,6 +496,35 @@ mod tests {
         let res = run_backtest(&b, &sig, &reg, &[0; 5], &cfg, 10_000.0, |_, _| 4.0);
         assert_eq!(res.trades.len(), 1);
         assert!((res.trades[0].quantity - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stop_exits_pay_exit_costs() {
+        // Stop trigger 95.0 on 10 @ ~100: exit must be WORSE than the raw
+        // level (spread + slippage crossed on the market exit order).
+        let b = bars(&[100.0, 99.0, 90.0, 91.0]);
+        let sig = vec![Signal::Long, Signal::Flat, Signal::Flat, Signal::Flat];
+        let reg = vec![Regime::Transition; 4];
+        let cfg = ExecConfig { stop_loss: 0.05, ..ExecConfig::default() };
+        let res = run_backtest(&b, &sig, &reg, &[0; 4], &cfg, 10_000.0, |_, _| 10.0);
+        let t = &res.trades[0];
+        assert_eq!(t.exit_reason, "stop_loss");
+        let raw = t.entry_price * 0.95;
+        assert!(t.exit_price.unwrap() < raw, "exit {:?} must be below raw level {raw}", t.exit_price);
+    }
+
+    #[test]
+    fn trades_carry_bar_timestamps() {
+        let mut b = bars(&[100.0, 101.0, 102.0, 103.0]);
+        for (i, bar) in b.iter_mut().enumerate() {
+            bar.t = 1_700_000_000 + i as i64 * 86_400;
+        }
+        let sig = vec![Signal::Long, Signal::Flat, Signal::Flat, Signal::Flat];
+        let reg = vec![Regime::Transition; 4];
+        let res = run_backtest(&b, &sig, &reg, &[0; 4], &ExecConfig::default(), 10_000.0, |_, _| 1.0);
+        let t = &res.trades[0];
+        assert_eq!(t.entry_t, 1_700_000_000 + 86_400); // entered bar 1
+        assert_eq!(t.exit_t.unwrap(), 1_700_000_000 + 86_400 * 2); // flat-exit bar 2
     }
 
     #[test]

@@ -109,6 +109,8 @@ mod tests {
         Trade {
             entry_idx: 0,
             exit_idx: Some(1),
+            entry_t: 0,
+            exit_t: Some(1),
             entry_price: 100.0,
             exit_price: Some(100.0),
             direction: 1,

@@ -48,10 +48,16 @@ pub struct ResearchConfig {
     pub max_open_risk: f64,
     /// Latch halt if intraday equity falls this fraction (§4).
     pub max_daily_loss: f64,
+    /// Latch halt if equity falls this fraction below the weekly window
+    /// peak (§4, 0 = disabled). Window = 5 daily sessions.
+    pub max_weekly_loss: f64,
     /// Latch halt if equity falls this fraction below peak (§4).
     pub max_drawdown: f64,
     /// Latch halt if exposure notional exceeds this multiple of equity (§4).
     pub max_exposure: f64,
+    /// Latch halt if correlated notional exceeds this multiple of equity
+    /// (§4, 0 = disabled; single-name books set 0).
+    pub max_correlated_exposure: f64,
     // execution
     pub commission: f64,
     pub spread: f64,
@@ -86,8 +92,10 @@ impl Default for ResearchConfig {
             max_positions: 3,
             max_open_risk: 0.06,
             max_daily_loss: 0.02,
+            max_weekly_loss: 0.05,
             max_drawdown: 0.10,
             max_exposure: 3.0,
+            max_correlated_exposure: 0.0,
             commission: 0.0005,
             spread: 0.0002,
             slippage: 0.0003,
@@ -192,11 +200,17 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
     if let Some(v) = want_num("strategy", "max_daily_loss") {
         cfg.max_daily_loss = v;
     }
+    if let Some(v) = want_num("strategy", "max_weekly_loss") {
+        cfg.max_weekly_loss = v;
+    }
     if let Some(v) = want_num("strategy", "max_drawdown") {
         cfg.max_drawdown = v;
     }
     if let Some(v) = want_num("strategy", "max_exposure") {
         cfg.max_exposure = v;
+    }
+    if let Some(v) = want_num("strategy", "max_correlated_exposure") {
+        cfg.max_correlated_exposure = v;
     }
     if let Some(v) = want_num("execution", "commission") {
         cfg.commission = v;
@@ -275,6 +289,9 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
     }
     if cfg.max_open_risk <= 0.0 || cfg.max_drawdown <= 0.0 || cfg.max_daily_loss <= 0.0 {
         return Err("config: max_open_risk/max_drawdown/max_daily_loss must all be > 0".into());
+    }
+    if cfg.max_weekly_loss < 0.0 || cfg.max_correlated_exposure < 0.0 {
+        return Err("config: max_weekly_loss/max_correlated_exposure must be >= 0".into());
     }
     Ok(cfg)
 }

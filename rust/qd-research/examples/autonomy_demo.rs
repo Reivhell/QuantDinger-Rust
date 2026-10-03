@@ -14,7 +14,7 @@ use qd_research::backtest::{run_backtest, ExecConfig, Signal};
 use qd_research::features::Bar;
 use qd_research::montecarlo::SplitMix64;
 use qd_research::regime::{detect, Regime, RegimeConfig};
-use qd_research::risk::{fixed_fractional_qty, liquidation_ok, KillSwitch, MAX_LEVERAGE};
+use qd_research::risk::{liquidation_ok, KillSwitch, MAX_LEVERAGE};
 
 fn synth_bars(n: usize, seed: u64) -> Vec<Bar> {
     let mut rng = SplitMix64(seed);
@@ -66,7 +66,30 @@ fn main() {
         ..ExecConfig::default()
     };
     let (risk, stop) = (cfg.risk_fraction, cfg.stop_loss);
-    let size = |px: f64, eq: f64| fixed_fractional_qty(px, eq, risk, stop, 20_000.0);
+    // Adaptive sizer: fixed-fractional base scaled by trailing vol,
+    // realized drawdown, and position crowding — never inflated.
+    let vols = qd_research::features::realized_volatility(&closes, 20, 252.0);
+    let size = |px: f64, eq: f64| {
+        // NOTE: the closure sizer sees only (price, equity); the demo feeds
+        // the latest trailing vol + zero book crowding. The full stateful
+        // path (live DD + open count) is exercised in unit tests.
+        let rv = vols.last().copied().flatten();
+        qd_research::risk::adaptive_qty(
+            px,
+            eq,
+            qd_research::risk::AdaptiveSizeCtx {
+                risk_fraction: risk,
+                stop_fraction: stop,
+                realized_vol_ann: rv,
+                target_vol_ann: 0.20,
+                current_dd: 0.0,
+                max_dd_allowance: cfg.max_drawdown,
+                open_positions: 0,
+                max_positions: cfg.max_positions,
+                max_position_notional: 20_000.0,
+            },
+        )
+    };
 
     // Baseline: raw signals, no autonomous control.
     let base = run_backtest(&bars, &raw_signals, &regimes, &feature_ids, &exec, 100_000.0, size);
@@ -97,7 +120,14 @@ fn main() {
     let auto = run_backtest(&bars, &gated_signals, &regimes, &feature_ids, &exec, 100_000.0, size);
 
     // Realized-risk watch: kill-switch over the autonomous equity curve.
-    let mut ks = KillSwitch::new(cfg.max_daily_loss, cfg.max_drawdown, cfg.max_exposure);
+    let mut ks = KillSwitch::with_weekly(
+        cfg.max_daily_loss,
+        cfg.max_weekly_loss,
+        cfg.max_drawdown,
+        cfg.max_exposure,
+        cfg.max_correlated_exposure,
+        5,
+    );
     let mut ks_trip: Option<String> = None;
     for (i, eq) in auto.equity_curve.iter().enumerate() {
         let new_day = i % 50 == 0; // synthetic daily session marker

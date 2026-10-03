@@ -99,7 +99,13 @@ fn main() {
     // become a fill; a kill-switch + emergency halt watch realized equity.
     // Blocked regimes mirror the reference strategy's discipline — now
     // enforced even though the signal layer ignores regime entirely.
-    let blocked = [Regime::Ranging, Regime::HighVolatility, Regime::LowVolatility];
+    let blocked = [
+        Regime::Ranging,
+        Regime::HighVolatility,
+        Regime::LowVolatility,
+        Regime::MeanReversion, // counter-trend turf: a trend signal has no thesis there
+        Regime::Abnormal,      // integrity uncertain → fail safe, never trade the print
+    ];
     let lev_ok = cfg.leverage >= 1.0
         && cfg.leverage <= MAX_LEVERAGE
         && liquidation_ok(cfg.leverage, cfg.stop_loss, 3.0);
@@ -148,7 +154,16 @@ fn main() {
     for t in &auto.trades {
         let pnl = t.net_pnl / 100_000.0;
         let dts = cfg.stop_loss + pnl; // adverse drift eats the stop buffer
-        match monitor_position(pnl, dts, false, false, t.entry_regime == Regime::HighVolatility) {
+        // Thesis abort: the position exited into ABNORMAL (integrity
+        // uncertain) or a counter-trend stretch (MEAN_REVERSION) — the
+        // trend thesis that opened it no longer holds.
+        let thesis_aborted = matches!(
+            t.exit_regime,
+            Some(Regime::Abnormal | Regime::MeanReversion)
+        );
+        let vol_extreme = t.entry_regime == Regime::HighVolatility
+            || matches!(t.exit_regime, Some(Regime::HighVolatility | Regime::Abnormal));
+        match monitor_position(pnl, dts, thesis_aborted, false, vol_extreme) {
             qd_research::autonomy::MonitorAction::Hold => holds += 1,
             qd_research::autonomy::MonitorAction::Exit(_) => exits += 1,
             qd_research::autonomy::MonitorAction::TightenStop => tightens += 1,

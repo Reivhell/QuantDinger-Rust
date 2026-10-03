@@ -237,7 +237,12 @@ fn main() {
                 );
                 let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
                 // Trade-count floor: <3 trades carries no rankable evidence.
-                let robust = if m.num_trades >= 3 { m.total_return } else { 0.0 };
+                // CAGR, not total return: IS windows (600 bars) are 4x the
+                // OOS windows (150 bars), so raw totals are length-biased —
+                // a perfectly stable edge shows ~75% "degradation" on totals
+                // alone. CAGR annualizes (252 bars/yr, daily data) and makes
+                // IS/OOS levels comparable. Same <3-trade floor → 0.0.
+                let robust = if m.num_trades >= 3 { m.cagr } else { 0.0 };
                 if hi == f.is_end {
                     is_row.push(robust);
                 } else {
@@ -278,7 +283,9 @@ fn main() {
                 |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
             );
             let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
-            row.push(if m.num_trades >= 3 { m.total_return } else { 0.0 });
+            // CAGR, not total return: CPCV runs vary in length, so raw
+            // totals are length-biased the same way IS/OOS windows were.
+            row.push(if m.num_trades >= 3 { m.cagr } else { 0.0 });
         }
         snoop_m.push(row);
     }

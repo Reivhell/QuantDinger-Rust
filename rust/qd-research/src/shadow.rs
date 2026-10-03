@@ -45,7 +45,7 @@ pub struct ShadowConfig {
     pub week_bars: u32,
     /// Bars per paper session (daily marker). Bar-count based: shadow has
     /// no wall clock, so session boundaries come from bar index, exactly
-    /// like the autonomous demo's synthetic daily marker.
+    /// like the autonomy check's paper daily marker.
     pub session_bars: usize,
 }
 

@@ -28,8 +28,8 @@ pub struct ResearchConfig {
     pub bars: usize,
     pub data_seed: u64,
     /// Path to a strict-CSV bar file (`t,open,high,low,close,volume`).
-    /// Empty = deterministic synthetic fixture. Non-empty = REAL market
-    /// data via [`crate::data::load_bars_csv`]; the fixture is never used.
+    /// Must be non-empty for real runs ([`crate::run::load_bars`] rejects
+    /// empty); the deterministic synthetic fixture is unit-test only.
     pub csv: String,
     // strategy
     pub strategy_name: String,

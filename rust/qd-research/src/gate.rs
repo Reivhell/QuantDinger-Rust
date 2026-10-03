@@ -1,5 +1,5 @@
 //! Evidence-fed §13 deployment gate: the single mapping from measured
-//! research evidence to [`DeploymentGate`] booleans. Both demos and any
+//! research evidence to [`DeploymentGate`] booleans. Both runners and any
 //! future runner use this — never hand-roll gate fields per call site.
 //!
 //! Design notes (why these thresholds, what can weaken them):

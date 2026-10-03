@@ -1,26 +1,44 @@
-//! Autonomous risk-control demo on seeded synthetic OHLCV.
+//! `autonomy_check <research.json>` — autonomous risk-control check on REAL
+//! market data.
 //!
-//! Exercises the deterministic safety stack end to end — the same series
-//! twice: once unguarded, once through the full autonomous pipeline
-//! (entry gate → kill-switch → emergency halt → monitor), then prints a
-//! deployment-gate verdict, a version-registry record, and one research-loop
-//! pass. No-trade outcomes are reported as idle evidence, never errors.
+//! Body/brain contract: the Python backend (`backend_api_python/`) is the
+//! brain — it owns scheduling and order submission. This binary is the body:
+//! it runs the configured strategy twice over the same REAL bars (once
+//! unguarded, once through the full autonomous pipeline: entry gate →
+//! kill-switch → emergency halt → monitor), then prints the §13 deployment
+//! verdict, a version-registry record, and one research-loop pass.
+//! No-trade outcomes are reported as idle evidence, never errors.
+//!
+//! Scope is the safety stack only (gate, monitor, kill-switch, emergency).
+//! The validation stages (WF, MC, PBO, sensitivity, shadow live in
+//! `research_run`) are absent here, so their evidence feeds `None` and the
+//! gate fails closed — the expected verdict is BLOCKED: proof the gate
+//! refuses to bless an unvalidated run.
 
 use qd_research::autonomy::{
     advance_loop, assess_entry, gate_signals, monitor_position, EmergencyState,
     EntryCtx, EntryVerdict, LoopStage, StrategyVersion, VersionRegistry,
 };
-use qd_research::backtest::{run_backtest, ExecConfig, Signal};
+use qd_research::backtest::{run_backtest, Signal};
 use qd_research::costs::{cost_stress, execution_sensitivity};
-use qd_research::data::synthetic_bars;
 use qd_research::regime::{detect, Regime, RegimeConfig};
-use qd_research::risk::{liquidation_ok, KillSwitch, MAX_LEVERAGE};
+use qd_research::risk::KillSwitch;
+use qd_research::run::{self, PERIODS_PER_YEAR, STARTING_EQUITY};
 
 fn main() {
-    let cfg = qd_research::config::load_config(qd_research::config::DEFAULT_CONFIG_JSON)
-        .expect("built-in default config parses");
-    let n = cfg.bars;
-    let bars = synthetic_bars(n, cfg.data_seed);
+    let args: Vec<String> = std::env::args().collect();
+    let cfg = if args.len() > 1 {
+        let text = std::fs::read_to_string(&args[1])
+            .unwrap_or_else(|e| panic!("cannot read config {}: {e}", args[1]));
+        qd_research::config::load_config(&text)
+            .unwrap_or_else(|e| panic!("invalid config {}: {e}", args[1]))
+    } else {
+        qd_research::config::load_config(qd_research::config::DEFAULT_CONFIG_JSON)
+            .expect("built-in default config parses")
+    };
+    let (bars, data_label) =
+        run::load_bars(&cfg).unwrap_or_else(|e| panic!("{e}"));
+    let n = bars.len();
     let regimes = detect(&bars, &vec![1i64; n], &RegimeConfig::default());
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
     // Strategy proposes: RAW EMA cross with NO regime filter. The strategy
@@ -36,22 +54,14 @@ fn main() {
         })
         .collect();
     let feature_ids = vec![1u64; n];
-    let exec = ExecConfig {
-        commission: cfg.commission,
-        spread: cfg.spread,
-        slippage: cfg.slippage,
-        latency_bars: cfg.latency_bars,
-        stop_loss: cfg.stop_loss,
-        take_profit: cfg.take_profit,
-        leverage: cfg.leverage,
-        ..ExecConfig::default()
-    };
+    let exec = run::exec_of(&cfg);
     let (risk, stop) = (cfg.risk_fraction, cfg.stop_loss);
     // Adaptive sizer: fixed-fractional base scaled by trailing vol,
     // realized drawdown, and position crowding — never inflated.
-    let vols = qd_research::features::realized_volatility(&closes, 20, 252.0);
+    let vols =
+        qd_research::features::realized_volatility(&closes, run::VOL_WINDOW, PERIODS_PER_YEAR);
     let size = |px: f64, eq: f64| {
-        // NOTE: the closure sizer sees only (price, equity); the demo feeds
+        // NOTE: the closure sizer sees only (price, equity); the check feeds
         // the latest trailing vol + zero book crowding. The full stateful
         // path (live DD + open count) is exercised in unit tests.
         let rv = vols.last().copied().flatten();
@@ -62,34 +72,26 @@ fn main() {
                 risk_fraction: risk,
                 stop_fraction: stop,
                 realized_vol_ann: rv,
-                target_vol_ann: 0.20,
+                target_vol_ann: run::TARGET_VOL_ANN,
                 current_dd: 0.0,
                 max_dd_allowance: cfg.max_drawdown,
                 open_positions: 0,
                 max_positions: cfg.max_positions,
-                max_position_notional: 20_000.0,
+                max_position_notional: run::MAX_POSITION_NOTIONAL,
             },
         )
     };
 
     // Baseline: raw signals, no autonomous control.
-    let base = run_backtest(&bars, &raw_signals, &regimes, &feature_ids, &exec, 100_000.0, size);
+    let base = run_backtest(&bars, &raw_signals, &regimes, &feature_ids, &exec, STARTING_EQUITY, size);
     let raw_longs = raw_signals.iter().filter(|s| **s != Signal::Flat).count();
 
     // Autonomous run: the multi-layer gate filters every bar BEFORE it can
     // become a fill; a kill-switch + emergency halt watch realized equity.
     // Blocked regimes mirror the reference strategy's discipline — now
     // enforced even though the signal layer ignores regime entirely.
-    let blocked = [
-        Regime::Ranging,
-        Regime::HighVolatility,
-        Regime::LowVolatility,
-        Regime::MeanReversion, // counter-trend turf: a trend signal has no thesis there
-        Regime::Abnormal,      // integrity uncertain → fail safe, never trade the print
-    ];
-    let lev_ok = cfg.leverage >= 1.0
-        && cfg.leverage <= MAX_LEVERAGE
-        && liquidation_ok(cfg.leverage, cfg.stop_loss, 3.0);
+    let blocked = run::blocked_regimes();
+    let lev_ok = run::leverage_ok(&cfg);
     let gate = EntryCtx {
         data_ok: true,
         emergency_halted: false,
@@ -104,7 +106,7 @@ fn main() {
         execution_ok: true,
     };
     let (gated_signals, suppressed) = gate_signals(&raw_signals, &regimes, &gate);
-    let auto = run_backtest(&bars, &gated_signals, &regimes, &feature_ids, &exec, 100_000.0, size);
+    let auto = run_backtest(&bars, &gated_signals, &regimes, &feature_ids, &exec, STARTING_EQUITY, size);
 
     // Realized-risk watch: kill-switch over the autonomous equity curve.
     let mut ks = KillSwitch::with_weekly(
@@ -113,11 +115,11 @@ fn main() {
         cfg.max_drawdown,
         cfg.max_exposure,
         cfg.max_correlated_exposure,
-        5,
+        run::WEEK_BARS,
     );
     let mut ks_trip: Option<String> = None;
     for (i, eq) in auto.equity_curve.iter().enumerate() {
-        let new_day = i % 50 == 0; // synthetic daily session marker
+        let new_day = i % run::SESSION_BARS == 0; // paper daily session marker
         if let Some(r) = ks.update(*eq, 0.0, new_day) {
             ks_trip = Some(r);
             break;
@@ -133,7 +135,7 @@ fn main() {
     let mut tightens = 0usize;
     let mut reduces = 0usize;
     for t in &auto.trades {
-        let pnl = t.net_pnl / 100_000.0;
+        let pnl = t.net_pnl / STARTING_EQUITY;
         let dts = cfg.stop_loss + pnl; // adverse drift eats the stop buffer
         // Thesis abort: the position exited into ABNORMAL (integrity
         // uncertain) or a counter-trend stretch (MEAN_REVERSION) — the
@@ -152,9 +154,9 @@ fn main() {
         }
     }
 
-    let b_ret = base.equity_curve.last().copied().unwrap_or(100_000.0) / 100_000.0 - 1.0;
-    let a_ret = auto.equity_curve.last().copied().unwrap_or(100_000.0) / 100_000.0 - 1.0;
-    println!("=== AUTONOMOUS RISK DEMO ===");
+    let b_ret = base.equity_curve.last().copied().unwrap_or(STARTING_EQUITY) / STARTING_EQUITY - 1.0;
+    let a_ret = auto.equity_curve.last().copied().unwrap_or(STARTING_EQUITY) / STARTING_EQUITY - 1.0;
+    println!("=== AUTONOMOUS RISK CHECK [{data_label}] ===");
     println!("baseline: {} signals → {} trades, return {:.2}%", raw_longs, base.trades.len(), b_ret * 100.0);
     println!(
         "gated:    {} trades ({} suppressed as idle), return {:.2}%",
@@ -167,30 +169,30 @@ fn main() {
     println!("monitor: {holds} hold / {tightens} tighten / {reduces} reduce / {exits} exit");
 
     // §13 deployment gate via the shared evidence mapping (fail-closed).
-    // Honest scope: this demo exercises the safety stack (gate, monitor,
+    // Honest scope: this check exercises the safety stack (gate, monitor,
     // kill-switch, emergency) — NOT the validation stages (WF, MC, PBO,
-    // sensitivity, shadow live in research_demo). Missing stages feed None
+    // sensitivity, shadow live in research_run). Missing stages feed None
     // and fail closed, so the expected verdict here is BLOCKED: proof the
     // gate refuses to bless an unvalidated run.
-    let m_auto = qd_research::metrics::compute_metrics(&auto.trades, &auto.equity_curve, 100_000.0, 252.0);
+    let m_auto = qd_research::metrics::compute_metrics(&auto.trades, &auto.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
     let gc: Vec<(f64, f64)> =
         auto.trades.iter().map(|t| (t.gross_pnl, t.fees + t.slippage_cost)).collect();
-    let cs = cost_stress(&gc, &[1.0, 1.25, 1.5, 2.0, 3.0]);
+    let cs = cost_stress(&gc, &run::COST_MULTIPLIERS);
     let dd_ok = auto.trades.iter().all(|t| t.mae <= cfg.stop_loss * 2.0);
     let gate13 = qd_research::gate::gate_from_evidence(&qd_research::gate::GateEvidence {
         realistic_costs: cfg.commission > 0.0 && cfg.slippage > 0.0,
-        walkforward: None, // not run in this demo → fails closed
-        monte_carlo: None, // not run in this demo → fails closed
+        walkforward: None, // not run in this check → fails closed
+        monte_carlo: None, // not run in this check → fails closed
         backtest_max_dd: m_auto.max_drawdown,
-        sensitivity: None, // not run in this demo → fails closed
-        pbo: None,         // not run in this demo → fails closed
+        sensitivity: None, // not run in this check → fails closed
+        pbo: None,         // not run in this check → fails closed
         cost_verdict: execution_sensitivity(&cs).to_string(),
         max_drawdown_cap: cfg.max_drawdown,
         stop_on_every_trade: cfg.stop_loss > 0.0 && dd_ok,
         leverage_ok: lev_ok,
         killswitch_verified: true, // KS watched the full equity curve above
-        snooping: None, // not run in this demo → fails closed
-        shadow: None, // no holdout in this demo → fails closed
+        snooping: None, // not run in this check → fails closed
+        shadow: None, // no holdout in this check → fails closed
     });
     println!(
         "deploy: {} {:?}",
@@ -204,7 +206,7 @@ fn main() {
         id: cfg.strategy_name.clone(),
         version: "0.1.0".into(),
         params: format!("fast={} slow={}", cfg.ema_fast, cfg.ema_slow),
-        data_range: format!("synthetic seed={}", cfg.data_seed),
+        data_range: data_label.clone(),
         train_range: "wf_train".into(),
         oos_range: "wf_oos+cpcv".into(),
         gate: gate13.clone(),

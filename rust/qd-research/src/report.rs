@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn json_is_machine_readable() {
         let r = ResearchInput {
-            strategy_name: "demo".into(),
+            strategy_name: "sample".into(),
             cost_verdict: "ROBUST".into(),
             regime_dependency: "LOW".into(),
             primary_weakness: "none observed".into(),
@@ -363,9 +363,9 @@ mod tests {
         let j = report_json(&r);
         assert!(j.starts_with('{') && j.ends_with('}'));
         assert!(j.contains("INSUFFICIENT DATA")); // no snoop evidence → honest, not faked
-        assert!(j.contains("\"strategy\":\"demo\""));
+        assert!(j.contains("\"strategy\":\"sample\""));
         let md = report_markdown(&r);
-        assert!(md.contains("# Strategy Research Report: demo"));
+        assert!(md.contains("# Strategy Research Report: sample"));
         assert!(md.contains("refused to fabricate"));
     }
 

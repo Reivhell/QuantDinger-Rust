@@ -1,27 +1,32 @@
-//! Full research-pipeline runner on REAL market data (or seeded fixture).
+//! `research_run <research.json>` — full research pipeline on REAL market data.
 //!
-//! Data comes from `data.csv` in the research config: a strict-CSV bar file
-//! (`t,open,high,low,close,volume`) produced e.g. by `fetch_okx.sh` from a
-//! public exchange API — no demo feed, no invented candles. Only when
-//! `data.csv` is empty does it fall back to the deterministic synthetic
-//! fixture (seeded, reproducible, labeled SYNTH in the report).
-//! Runs features → regime → two reference strategies → backtest → metrics →
-//! MAE/MFE → walk-forward → Monte Carlo → CPCV → PBO → sensitivity → cost
-//! stress → shadow (§12 bulkhead on the unseen last third) → §13
-//! deployment gate (evidence-fed, fail-closed) → §14 version registry →
-//! §12 loop transition → JSON + Markdown report. Proves the pipeline is
-//! wired end to end.
+//! Body/brain contract: the Python backend (`backend_api_python/`) is the
+//! brain — it owns data fetching (see `fetch_okx.sh`), scheduling, and order
+//! submission. This binary is the body: it reads the CSV path from the
+//! config, runs features → regime → strategy → backtest → metrics → MAE/MFE
+//! → walk-forward → Monte Carlo → CPCV → PBO → sensitivity → cost stress →
+//! shadow (§12 bulkhead on the unseen last third) → §13 deployment gate →
+//! §14 version registry → loop transition, and prints the JSON + Markdown
+//! report on stdout. Exit non-zero on bad config / bad data; a BLOCKED gate
+//! is evidence output (exit 0), never an error.
+//!
+//! Machine contract: the JSON report is the text between the `=== JSON ===`
+//! marker line and the blank line before `=== MARKDOWN ===`. Empty
+//! `data.csv` is rejected — the synthetic fixture is unit-test only.
 
-use qd_research::backtest::{run_backtest, ExecConfig};
+use qd_research::backtest::Signal;
 use qd_research::costs::{cost_stress, execution_sensitivity};
 use qd_research::cpcv::{contiguous_runs, cpcv_splits, score_cpcv_paths};
-use qd_research::data::{load_bars_csv, synthetic_bars};
+use qd_research::features::Bar;
 use qd_research::mae_mfe::analyze_mae_mfe;
 use qd_research::metrics::compute_metrics;
 use qd_research::montecarlo::run_monte_carlo;
 use qd_research::pbo::{analyze_overfitting, PboBands, ScoreMatrix};
-use qd_research::regime::{detect, RegimeConfig};
+use qd_research::regime::{detect, Regime, RegimeConfig};
 use qd_research::report::{regime_slices, report_json, report_markdown, ResearchInput};
+use qd_research::run::{
+    self, family_of, StrategyFam, PERIODS_PER_YEAR, STARTING_EQUITY,
+};
 use qd_research::sensitivity::{analyze_sensitivity, ParamPoint};
 use qd_research::strategies::{DonchianBreakout, EmaCrossTrend, RsiMeanReversion};
 use qd_research::walkforward::{build_folds, summarize_walkforward, FoldOutcome};
@@ -39,22 +44,10 @@ fn main() {
         qd_research::config::load_config(qd_research::config::DEFAULT_CONFIG_JSON)
             .expect("built-in default config parses")
     };
-    let n_cfg = cfg.bars;
-    // REAL data first: `data.csv` (public exchange candles via fetch_okx.sh).
-    // Synthetic only when no CSV is configured — and the report says so.
-    let (bars, data_label) = if cfg.csv.trim().is_empty() {
-        (
-            synthetic_bars(n_cfg, cfg.data_seed),
-            format!("synthetic seeded (seed={})", cfg.data_seed),
-        )
-    } else {
-        let text = std::fs::read_to_string(&cfg.csv)
-            .unwrap_or_else(|e| panic!("cannot read data.csv {}: {e}", cfg.csv));
-        let loaded = load_bars_csv(&text)
-            .unwrap_or_else(|e| panic!("invalid CSV {}: {e}", cfg.csv));
-        let label = format!("REAL {} ({} bars, t {}..{})", cfg.csv, loaded.len(), loaded.first().map(|b| b.t).unwrap_or(0), loaded.last().map(|b| b.t).unwrap_or(0));
-        (loaded, label)
-    };
+    // REAL market bars only — empty `data.csv` is rejected, never silently
+    // replaced with synthetic data.
+    let (bars, data_label) =
+        run::load_bars(&cfg).unwrap_or_else(|e| panic!("{e}"));
     let n = bars.len();
     if n < cfg.wf_train + cfg.wf_oos {
         panic!(
@@ -71,51 +64,26 @@ fn main() {
     // Donchian breakout (volume-confirmed range escapes, long-only).
     // All share the same pipeline below — only the signal source differs.
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-    let fam: &str = match cfg.strategy_name.as_str() {
-        "RsiMeanReversion" => "rsi",
-        "DonchianBreakout" => "donchian",
-        _ => "ema",
-    };
-    let use_rsi = fam == "rsi";
-    let signals = match fam {
-        "rsi" => RsiMeanReversion {
-            period: cfg.rsi_period,
-            oversold: cfg.rsi_oversold,
-            overbought: cfg.rsi_overbought,
-            allow_shorts: cfg.rsi_shorts,
-        }
-        .signals(&closes, &regimes),
-        "donchian" => DonchianBreakout {
-            lookback: cfg.donchian_lookback,
-            relvol_min: cfg.donchian_relvol,
-        }
-        .signals(&bars, &regimes),
-        _ => EmaCrossTrend { fast: cfg.ema_fast, slow: cfg.ema_slow }.signals(&closes, &regimes),
-    };
-    let wf_label = match fam {
-        "rsi" => format!("rsi{}/{}-{}", cfg.rsi_period, cfg.rsi_oversold, cfg.rsi_overbought),
-        "donchian" => {
-            format!("donch{}/rv{:.1}", cfg.donchian_lookback, cfg.donchian_relvol)
-        }
-        _ => format!("ema{}/{}", cfg.ema_fast, cfg.ema_slow),
-    };
+    let fam = family_of(&cfg.strategy_name);
+    let use_rsi = fam == StrategyFam::Rsi;
+    let signals = run::build_signals(fam, &cfg, &bars, &closes, &regimes);
+    let wf_label = run::fold_label(fam, &cfg);
     let feature_ids = vec![1u64; n];
-    let exec = ExecConfig {
-        commission: cfg.commission,
-        spread: cfg.spread,
-        slippage: cfg.slippage,
-        latency_bars: cfg.latency_bars,
-        stop_loss: cfg.stop_loss,
-        take_profit: cfg.take_profit,
-        ..ExecConfig::default()
-    };
-    let (risk, stop) = (cfg.risk_fraction, cfg.stop_loss);
-    let res = run_backtest(&bars, &signals, &regimes, &feature_ids, &exec, 100_000.0, |px, eq| {
-        qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
-    });
-    let metrics = compute_metrics(&res.trades, &res.equity_curve, 100_000.0, 252.0);
+    let exec = run::exec_of(&cfg);
+    let res = qd_research::backtest::run_backtest(
+        &bars,
+        &signals,
+        &regimes,
+        &feature_ids,
+        &exec,
+        STARTING_EQUITY,
+        |px, eq| run::fixed_qty(px, eq, &cfg),
+    );
+    let metrics =
+        compute_metrics(&res.trades, &res.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
     let mae = analyze_mae_mfe(&res.trades);
-    let rets: Vec<f64> = res.trades.iter().map(|t| t.net_pnl / 100_000.0).collect();
+    let rets: Vec<f64> =
+        res.trades.iter().map(|t| t.net_pnl / STARTING_EQUITY).collect();
 
     // Walk-forward: IS window → (trivial selection) → OOS scoring.
     let folds = build_folds(n, cfg.wf_train, cfg.wf_oos, cfg.wf_step, false);
@@ -125,10 +93,10 @@ fn main() {
         let sub_sig = &signals[f.oos_start..f.oos_end];
         let sub_reg = &regimes[f.oos_start..f.oos_end];
         let sub_fid = &feature_ids[f.oos_start..f.oos_end];
-        let r = run_backtest(sub, sub_sig, sub_reg, sub_fid, &exec, 100_000.0, |px, eq| {
-            qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
+        let r = qd_research::backtest::run_backtest(sub, sub_sig, sub_reg, sub_fid, &exec, STARTING_EQUITY, |px, eq| {
+            run::fixed_qty(px, eq, &cfg)
         });
-        let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
+        let m = compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
         outcomes.push(FoldOutcome {
             fold: k,
             selected_config: wf_label.clone(),
@@ -149,33 +117,30 @@ fn main() {
     // each run starts with no position.
     let splits = cpcv_splits(n, cfg.cpcv_partitions, cfg.cpcv_test, 5, 2);
     let cpcv_scores = score_cpcv_paths(&splits, 50, |lo, hi| {
-        let r = run_backtest(
+        let r = qd_research::backtest::run_backtest(
             &bars[lo..hi],
             &signals[lo..hi],
             &regimes[lo..hi],
             &feature_ids[lo..hi],
             &exec,
-            100_000.0,
-            |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
+            STARTING_EQUITY,
+            |px, eq| run::fixed_qty(px, eq, &cfg),
         );
-        compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0).total_return
+        compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR).total_return
     });
     let cpcv_summary = qd_research::montecarlo::summarize(cpcv_scores);
 
     // PBO over a small honest grid. EMA: fast ∈ {10,20,30} × slow ∈ {50,100}.
     // RSI: period ∈ {7,14,21} × oversold ∈ {25,30,35} (overbought fixed).
     // Donchian: lookback ∈ {10,20,30} × relvol ∈ {1.5,2.0}.
-    // Same folds, IS robust-return vs OOS robust-return — IS/OOS degradation
-    // decides. Robust = CAGR with a zero-trade floor: Sharpe on 0-2 trades
-    // was ±infinity garbage (var≈0), which is why a floor exists at all;
-    // CAGR has no such singularity, so only genuinely flat windows (0
-    // trades) score 0.0. 1-2 trade windows keep their real CAGR.
+    // Same folds, IS robust-return vs OOS robust-return.
+    // Robust = CAGR with a zero-trade floor (see `run::robust_cagr`).
     let mut cfgs = Vec::new();
     let mut is_m = Vec::new();
     let mut oos_m = Vec::new();
     // (label, signal-builder): boxed so the family loop below is shared.
-    type SigFn = dyn Fn(&[qd_research::features::Bar], &[f64], &[qd_research::regime::Regime]) -> Vec<qd_research::backtest::Signal>;
-    let grid: Vec<(String, Box<SigFn>)> = if fam == "donchian" {
+    type SigFn = dyn Fn(&[Bar], &[f64], &[Regime]) -> Vec<Signal>;
+    let grid: Vec<(String, Box<SigFn>)> = if fam == StrategyFam::Donchian {
         let mut g: Vec<(String, Box<SigFn>)> = Vec::new();
         for lb in [10usize, 20, 30] {
             for rv in [1.5f64, 2.0] {
@@ -196,7 +161,7 @@ fn main() {
                 let sh = cfg.rsi_shorts;
                 g.push((
                     format!("rsi{p}/{os}-{ob}"),
-                    Box::new(move |_, c: &[f64], r: &[qd_research::regime::Regime]| {
+                    Box::new(move |_, c: &[f64], r: &[Regime]| {
                         RsiMeanReversion { period: p, oversold: os, overbought: ob, allow_shorts: sh }.signals(c, r)
                     }),
                 ));
@@ -212,7 +177,7 @@ fn main() {
                 }
                 g.push((
                     format!("ema{fast}/{slow}"),
-                    Box::new(move |_, c: &[f64], r: &[qd_research::regime::Regime]| {
+                    Box::new(move |_, c: &[f64], r: &[Regime]| {
                         EmaCrossTrend { fast, slow }.signals(c, r)
                     }),
                 ));
@@ -227,29 +192,18 @@ fn main() {
         for f in build_folds(n, cfg.wf_train, cfg.wf_oos, cfg.wf_step, false) {
             let sg = build(&bars, &closes, &regimes);
             for (lo, hi) in [(f.is_start, f.is_end), (f.oos_start, f.oos_end)] {
-                let r = run_backtest(
+                let r = qd_research::backtest::run_backtest(
                     &bars[lo..hi],
                     &sg[lo..hi],
                     &regimes[lo..hi],
                     &feature_ids[lo..hi],
                     &exec,
-                    100_000.0,
-                    |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
+                    STARTING_EQUITY,
+                    |px, eq| run::fixed_qty(px, eq, &cfg),
                 );
-                let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
-                // Trade-count floor: 0 trades = flat window, no evidence → 0.0.
-                // 1-2 trades are noisy but REAL — zeroing them fabricates flat
-                // windows and drags short-window medians to exactly 0.0 (which
-                // is what pinned degradation at 1.0: most 150-bar OOS windows
-                // hold ~2 Donchian trades). CAGR cannot go ±infinite the way
-                // Sharpe did (no near-zero variance division), so no wider
-                // floor is needed.
-                // CAGR, not total return: IS windows (600 bars) are 4x the
-                // OOS windows (150 bars), so raw totals are length-biased —
-                // a perfectly stable edge shows ~75% "degradation" on totals
-                // alone. CAGR annualizes (252 bars/yr, daily data) and makes
-                // IS/OOS levels comparable. 0-trade windows → 0.0.
-                let robust = if m.num_trades == 0 { 0.0 } else { m.cagr };
+                let m =
+                    compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
+                let robust = run::robust_cagr(m.num_trades, m.cagr);
                 if hi == f.is_end {
                     is_row.push(robust);
                 } else {
@@ -267,8 +221,8 @@ fn main() {
 
     // Data snooping (§7 luck adjustment): White RC + Hansen SPA over the
     // grid scored on every CPCV run (K configs × R runs, vs cash). Each run
-    // is a contiguous flat-to-flat OOS window with the <3-trade floor, so
-    // T = R ≈ 23 clears the min_periods=10 bar where the 2 WF folds cannot.
+    // is a contiguous flat-to-flat OOS window, so T = R ≈ 23 clears the
+    // min_periods=10 bar where the 2 WF folds cannot.
     // Thin grids still return None (fail-closed) — never faked.
     let snoop_runs: Vec<(usize, usize)> = splits
         .iter()
@@ -280,20 +234,18 @@ fn main() {
         let sg = build(&bars, &closes, &regimes);
         let mut row = Vec::with_capacity(snoop_runs.len());
         for (lo, hi) in &snoop_runs {
-            let r = run_backtest(
+            let r = qd_research::backtest::run_backtest(
                 &bars[*lo..*hi],
                 &sg[*lo..*hi],
                 &regimes[*lo..*hi],
                 &feature_ids[*lo..*hi],
                 &exec,
-                100_000.0,
-                |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
+                STARTING_EQUITY,
+                |px, eq| run::fixed_qty(px, eq, &cfg),
             );
-            let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
-            // CAGR, not total return: CPCV runs vary in length, so raw
-            // totals are length-biased the same way IS/OOS windows were.
-            // 0-trade runs → 0.0; 1-2 trades are real, keep their CAGR.
-            row.push(if m.num_trades == 0 { 0.0 } else { m.cagr });
+            let m =
+                compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
+            row.push(run::robust_cagr(m.num_trades, m.cagr));
         }
         snoop_m.push(row);
     }
@@ -314,11 +266,10 @@ fn main() {
         None => println!("snooping: INSUFFICIENT DATA (OOS matrix too thin) — no p-values fabricated"),
     }
 
-    // Sensitivity around the configured knob (full-sample robust return —
-    // total return with the same <3-trade floor, so thin windows score 0
-    // instead of Sharpe ±infinity): EMA fast, RSI period, or Donchian
-    // lookback. Plateau = robust.
-    let (sens_name, sens_base, sens_vals): (&str, f64, Vec<f64>) = if fam == "donchian" {
+    // Sensitivity around the configured knob (full-sample CAGR with the
+    // zero-trade floor): EMA fast, RSI period, or Donchian lookback.
+    // Plateau = robust.
+    let (sens_name, sens_base, sens_vals): (&str, f64, Vec<f64>) = if fam == StrategyFam::Donchian {
         ("donchian_lookback", cfg.donchian_lookback as f64, vec![10.0, 15.0, 20.0, 25.0, 30.0])
     } else if use_rsi {
         ("rsi_period", cfg.rsi_period as f64, vec![7.0, 10.0, 14.0, 18.0, 21.0])
@@ -330,7 +281,7 @@ fn main() {
         ("ema_fast", cfg.ema_fast as f64, v)
     };
     let score_of = |val: f64| {
-        let sg = if fam == "donchian" {
+        let sg = if fam == StrategyFam::Donchian {
             DonchianBreakout {
                 lookback: (val as usize).max(2),
                 relvol_min: cfg.donchian_relvol,
@@ -348,14 +299,14 @@ fn main() {
             EmaCrossTrend { fast: (val as usize).max(2), slow: cfg.ema_slow }
                 .signals(&closes, &regimes)
         };
-        let r = run_backtest(&bars, &sg, &regimes, &feature_ids, &exec, 100_000.0, |px, eq| {
-            qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
+        let r = qd_research::backtest::run_backtest(&bars, &sg, &regimes, &feature_ids, &exec, STARTING_EQUITY, |px, eq| {
+            run::fixed_qty(px, eq, &cfg)
         });
-        let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
+        let m = compute_metrics(&r.trades, &r.equity_curve, STARTING_EQUITY, PERIODS_PER_YEAR);
         // Full-sample window is identical for every knob value, so total
         // return and CAGR rank identically — use CAGR for consistency with
         // the PBO/snooping grids. 0 trades → 0.0 (flat, no evidence).
-        if m.num_trades == 0 { 0.0 } else { m.cagr }
+        run::robust_cagr(m.num_trades, m.cagr)
     };
     let sweep: Vec<ParamPoint> = sens_vals
         .iter()
@@ -370,7 +321,7 @@ fn main() {
     );
 
     let gc: Vec<(f64, f64)> = res.trades.iter().map(|t| (t.gross_pnl, t.fees + t.slippage_cost)).collect();
-    let cs = cost_stress(&gc, &[1.0, 1.25, 1.5, 2.0, 3.0]);
+    let cs = cost_stress(&gc, &run::COST_MULTIPLIERS);
     let cv = execution_sensitivity(&cs).to_string();
 
     // Shadow bulkhead (§12): the LAST third of bars is unseen by every
@@ -381,30 +332,8 @@ fn main() {
     // Shadow → Deploy loop transition.
     let shadow_lo = 2 * n / 3;
     let shadow = {
-        use qd_research::regime::Regime as RG;
-        use qd_research::shadow::{compare_candidate, run_shadow, ShadowConfig};
-        let scfg = ShadowConfig {
-            starting_equity: 100_000.0,
-            max_positions: cfg.max_positions,
-            max_open_risk: cfg.max_open_risk,
-            blocked_regimes: vec![
-                RG::Ranging,
-                RG::HighVolatility,
-                RG::LowVolatility,
-                RG::MeanReversion,
-                RG::Abnormal,
-            ],
-            leverage_ok: true,
-            stop_present: cfg.stop_loss > 0.0,
-            execution_ok: true,
-            ks_daily: cfg.max_daily_loss,
-            ks_weekly: cfg.max_weekly_loss,
-            ks_drawdown: cfg.max_drawdown,
-            ks_exposure: cfg.max_exposure,
-            ks_corr: cfg.max_correlated_exposure,
-            week_bars: 5,
-            session_bars: 50,
-        };
+        use qd_research::shadow::{compare_candidate, run_shadow};
+        let scfg = run::shadow_config(&cfg, run::leverage_ok(&cfg));
         let w = |lo: usize| {
             (
                 &bars[lo..],
@@ -415,36 +344,19 @@ fn main() {
         };
         let (wb, ws, wr, wf) = w(shadow_lo);
         let cand = run_shadow(wb, ws, wr, wf, &exec, |px, eq| {
-            qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
+            run::fixed_qty(px, eq, &cfg)
         }, &scfg)
         .expect("shadow candidate runs");
         // Incumbent: a duller sibling of the same family on the same unseen
         // window — slow EMA, slow/long RSI, or longer-channel Donchian.
-        let inc_sig = if fam == "donchian" {
-            DonchianBreakout {
-                lookback: cfg.donchian_lookback + 10,
-                relvol_min: cfg.donchian_relvol,
-            }
-            .signals(&bars, &regimes)
-        } else if use_rsi {
-            RsiMeanReversion {
-                period: cfg.rsi_period + 7,
-                oversold: cfg.rsi_oversold - 5.0,
-                overbought: cfg.rsi_overbought,
-                allow_shorts: cfg.rsi_shorts,
-            }
-            .signals(&closes, &regimes)
-        } else {
-            EmaCrossTrend { fast: cfg.ema_fast + 10, slow: cfg.ema_slow + 50 }
-                .signals(&closes, &regimes)
-        };
+        let inc_sig = run::incumbent_signals(fam, &cfg, &bars, &closes, &regimes);
         let inc = run_shadow(
             &bars[shadow_lo..],
             &inc_sig[shadow_lo..],
             &regimes[shadow_lo..],
             &feature_ids[shadow_lo..],
             &exec,
-            |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
+            |px, eq| run::fixed_qty(px, eq, &cfg),
             &scfg,
         )
         .expect("shadow incumbent runs");
@@ -492,48 +404,13 @@ fn main() {
         cost_verdict: cv.clone(),
         max_drawdown_cap: cfg.max_drawdown,
         stop_on_every_trade: cfg.stop_loss > 0.0,
-        leverage_ok: qd_research::risk::liquidation_ok(cfg.leverage, cfg.stop_loss, 3.0),
+        leverage_ok: run::leverage_ok(&cfg),
         killswitch_verified: true, // shadow runs under the live kill-switch
         snooping: snoop.clone(),
         shadow: Some((&shadow).into()),
     };
 
-    let (strat_label, strat_cfg) = if fam == "donchian" {
-        (
-            format!(
-                "DonchianBreakout({},rv{:.1})",
-                cfg.donchian_lookback, cfg.donchian_relvol
-            ),
-            format!(
-                "lookback={} relvol={:.2} stop={:.3} take={:.3} risk={:.3}",
-                cfg.donchian_lookback, cfg.donchian_relvol,
-                cfg.stop_loss, cfg.take_profit, cfg.risk_fraction
-            ),
-        )
-    } else if use_rsi {
-        (
-            format!(
-                "RsiMeanReversion({},{:.0},{:.0}{})",
-                cfg.rsi_period,
-                cfg.rsi_oversold,
-                cfg.rsi_overbought,
-                if cfg.rsi_shorts { ",shorts" } else { ",long-only" }
-            ),
-            format!(
-                "period={} os={:.0} ob={:.0} shorts={} stop={:.3} take={:.3} risk={:.3}",
-                cfg.rsi_period, cfg.rsi_oversold, cfg.rsi_overbought,
-                cfg.rsi_shorts, cfg.stop_loss, cfg.take_profit, cfg.risk_fraction
-            ),
-        )
-    } else {
-        (
-            format!("EmaCrossTrend({},{})", cfg.ema_fast, cfg.ema_slow),
-            format!(
-                "fast={} slow={} stop={:.3} take={:.3} risk={:.3}",
-                cfg.ema_fast, cfg.ema_slow, cfg.stop_loss, cfg.take_profit, cfg.risk_fraction
-            ),
-        )
-    };
+    let (strat_label, strat_cfg) = run::strategy_identity(fam, &cfg);
     // §13 gate evaluate → §14 registry publish → §12 loop transition,
     // after the final strategy identity exists. Failures return to
     // Research — never live.
@@ -551,7 +428,7 @@ fn main() {
         gate: gate.clone(),
         risk: format!(
             "SL={:.0}% lev={:.0}x risk={:.2}% maxdd={:.0}%",
-            cfg.stop_loss * 100.0, cfg.leverage, risk * 100.0, cfg.max_drawdown * 100.0
+            cfg.stop_loss * 100.0, cfg.leverage, cfg.risk_fraction * 100.0, cfg.max_drawdown * 100.0
         ),
         exec: format!(
             "comm={} spread={} slip={} lat={}",
@@ -577,7 +454,7 @@ fn main() {
         timeframe: cfg.timeframe.clone(),
         date_range: data_label.clone(),
         n_bars: n,
-        regime_perf: regime_slices(&res.trades, 100_000.0),
+        regime_perf: regime_slices(&res.trades, STARTING_EQUITY),
         walkforward: Some(wf),
         montecarlo: Some(mc),
         cpcv_paths: splits.len(),
@@ -590,11 +467,7 @@ fn main() {
         sensitivity: vec![sens],
         cost_stress: cs,
         shadow: Some(shadow),
-        primary_weakness: if cfg.csv.trim().is_empty() {
-            "synthetic fixture — see regime table".into()
-        } else {
-            format!("real-data run ({data_label}) — see regime table")
-        },
+        primary_weakness: format!("real-data run ({data_label}) — see regime table"),
         regime_dependency: "see regime table".into(),
         metrics,
         mae_mfe: Some(mae),

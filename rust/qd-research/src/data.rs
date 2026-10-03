@@ -79,8 +79,8 @@ pub fn load_bars_csv(text: &str) -> Result<Vec<Bar>, String> {
 }
 
 /// Deterministic GBM-ish fixture: trend phase, range phase, shock phase.
-/// Same `(n, seed)` → identical bars, always. Test/demo fixture only —
-/// never a substitute for real market data.
+/// Same `(n, seed)` → identical bars, always. Unit-test fixture only —
+/// real runs load market data via [`crate::run::load_bars`].
 pub fn synthetic_bars(n: usize, seed: u64) -> Vec<Bar> {
     let mut rng = SplitMix64(seed);
     let mut bars = Vec::with_capacity(n);

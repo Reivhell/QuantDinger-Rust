@@ -35,6 +35,10 @@ pub struct ResearchConfig {
     pub strategy_name: String,
     pub ema_fast: usize,
     pub ema_slow: usize,
+    pub rsi_period: usize,
+    pub rsi_oversold: f64,
+    pub rsi_overbought: f64,
+    pub rsi_shorts: bool,
     pub stop_loss: f64,
     pub take_profit: f64,
     pub risk_fraction: f64,
@@ -90,6 +94,10 @@ impl Default for ResearchConfig {
             strategy_name: "EmaCrossTrend".into(),
             ema_fast: 20,
             ema_slow: 50,
+            rsi_period: 14,
+            rsi_oversold: 30.0,
+            rsi_overbought: 70.0,
+            rsi_shorts: false,
             stop_loss: 0.03,
             take_profit: 0.06,
             risk_fraction: 0.01,
@@ -159,8 +167,8 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
             }
         }
     }
-    let mut want_num = |sec: &str, key: &str| -> Option<f64> {
-        match obj(&root, sec).and_then(|o| obj(o, key)) {
+    fn want(root: &JsonVal, bad: &mut Vec<String>, sec: &str, key: &str) -> Option<f64> {
+        match obj(root, sec).and_then(|o| obj(o, key)) {
             None => None,
             Some(v) => match num(v) {
                 Some(x) => Some(x),
@@ -170,90 +178,105 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
                 }
             },
         }
-    };
-    if let Some(v) = want_num("data", "bars") {
+    }
+    if let Some(v) = want(&root, &mut bad, "data", "bars") {
         cfg.bars = v as usize;
     }
-    if let Some(v) = want_num("data", "seed") {
+    if let Some(v) = want(&root, &mut bad, "data", "seed") {
         cfg.data_seed = v as u64;
     }
-    if let Some(v) = want_num("strategy", "fast") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "fast") {
         cfg.ema_fast = v as usize;
     }
-    if let Some(v) = want_num("strategy", "slow") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "slow") {
         cfg.ema_slow = v as usize;
     }
-    if let Some(v) = want_num("strategy", "stop_loss") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "rsi_period") {
+        cfg.rsi_period = v as usize;
+    }
+    if let Some(v) = want(&root, &mut bad, "strategy", "rsi_oversold") {
+        cfg.rsi_oversold = v;
+    }
+    if let Some(v) = want(&root, &mut bad, "strategy", "rsi_overbought") {
+        cfg.rsi_overbought = v;
+    }
+    if let Some(v) = want(&root, &mut bad, "strategy", "stop_loss") {
         cfg.stop_loss = v;
     }
-    if let Some(v) = want_num("strategy", "take_profit") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "take_profit") {
         cfg.take_profit = v;
     }
-    if let Some(v) = want_num("strategy", "risk_fraction") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "risk_fraction") {
         cfg.risk_fraction = v;
     }
-    if let Some(v) = want_num("strategy", "max_stop_loss") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "max_stop_loss") {
         cfg.max_stop_loss = v;
     }
-    if let Some(v) = want_num("strategy", "leverage") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "leverage") {
         cfg.leverage = v;
     }
-    if let Some(v) = want_num("strategy", "max_positions") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "max_positions") {
         cfg.max_positions = v as usize;
     }
-    if let Some(v) = want_num("strategy", "max_open_risk") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "max_open_risk") {
         cfg.max_open_risk = v;
     }
-    if let Some(v) = want_num("strategy", "max_daily_loss") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "max_daily_loss") {
         cfg.max_daily_loss = v;
     }
-    if let Some(v) = want_num("strategy", "max_weekly_loss") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "max_weekly_loss") {
         cfg.max_weekly_loss = v;
     }
-    if let Some(v) = want_num("strategy", "max_drawdown") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "max_drawdown") {
         cfg.max_drawdown = v;
     }
-    if let Some(v) = want_num("strategy", "max_exposure") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "max_exposure") {
         cfg.max_exposure = v;
     }
-    if let Some(v) = want_num("strategy", "max_correlated_exposure") {
+    if let Some(v) = want(&root, &mut bad, "strategy", "max_correlated_exposure") {
         cfg.max_correlated_exposure = v;
     }
-    if let Some(v) = want_num("execution", "commission") {
+    if let Some(v) = want(&root, &mut bad, "execution", "commission") {
         cfg.commission = v;
     }
-    if let Some(v) = want_num("execution", "spread") {
+    if let Some(v) = want(&root, &mut bad, "execution", "spread") {
         cfg.spread = v;
     }
-    if let Some(v) = want_num("execution", "slippage") {
+    if let Some(v) = want(&root, &mut bad, "execution", "slippage") {
         cfg.slippage = v;
     }
-    if let Some(v) = want_num("execution", "latency_bars") {
+    if let Some(v) = want(&root, &mut bad, "execution", "latency_bars") {
         cfg.latency_bars = v as usize;
     }
-    if let Some(v) = want_num("robustness", "mc_sims") {
+    if let Some(v) = want(&root, &mut bad, "robustness", "mc_sims") {
         cfg.mc_sims = v as usize;
     }
-    if let Some(v) = want_num("robustness", "seed") {
+    if let Some(v) = want(&root, &mut bad, "robustness", "seed") {
         cfg.mc_seed = v as u64;
     }
-    if let Some(v) = want_num("robustness", "cpcv_partitions") {
+    if let Some(v) = want(&root, &mut bad, "robustness", "cpcv_partitions") {
         cfg.cpcv_partitions = v as usize;
     }
-    if let Some(v) = want_num("robustness", "cpcv_test") {
+    if let Some(v) = want(&root, &mut bad, "robustness", "cpcv_test") {
         cfg.cpcv_test = v as usize;
     }
-    if let Some(v) = want_num("robustness", "wf_train") {
+    if let Some(v) = want(&root, &mut bad, "robustness", "wf_train") {
         cfg.wf_train = v as usize;
     }
-    if let Some(v) = want_num("robustness", "wf_oos") {
+    if let Some(v) = want(&root, &mut bad, "robustness", "wf_oos") {
         cfg.wf_oos = v as usize;
     }
-    if let Some(v) = want_num("robustness", "wf_step") {
+    if let Some(v) = want(&root, &mut bad, "robustness", "wf_step") {
         cfg.wf_step = v as usize;
     }
-    if let Some(v) = want_num("robustness", "min_oos_fraction") {
+    if let Some(v) = want(&root, &mut bad, "robustness", "min_oos_fraction") {
         cfg.min_oos_fraction = v;
+    }
+    if let Some(v) = obj(&root, "strategy").and_then(|o| obj(o, "rsi_shorts")) {
+        match v {
+            JsonVal::Bool(b) => cfg.rsi_shorts = *b,
+            _ => bad.push("strategy.rsi_shorts: expected boolean".into()),
+        }
     }
     if !bad.is_empty() {
         return Err(format!("config: type errors: {}", bad.join(", ")));
@@ -264,6 +287,16 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
     }
     if cfg.ema_fast >= cfg.ema_slow {
         return Err("config: strategy.fast must be < strategy.slow".into());
+    }
+    if cfg.strategy_name == "RsiMeanReversion" {
+        if cfg.rsi_period < 2 {
+            return Err("config: strategy.rsi_period must be >= 2".into());
+        }
+        if !(0.0 < cfg.rsi_oversold && cfg.rsi_oversold < cfg.rsi_overbought && cfg.rsi_overbought < 100.0) {
+            return Err("config: need 0 < rsi_oversold < rsi_overbought < 100".into());
+        }
+    } else if cfg.strategy_name != "EmaCrossTrend" {
+        return Err(format!("config: unknown strategy.name '{}' (EmaCrossTrend | RsiMeanReversion)", cfg.strategy_name));
     }
     if cfg.bars < cfg.wf_train + cfg.wf_oos {
         return Err("config: data.bars must fit one walk-forward train+oos window".into());

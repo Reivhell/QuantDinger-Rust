@@ -21,7 +21,7 @@ use qd_research::pbo::{analyze_overfitting, PboBands, ScoreMatrix};
 use qd_research::regime::{detect, RegimeConfig};
 use qd_research::report::{regime_slices, report_json, report_markdown, ResearchInput};
 use qd_research::sensitivity::{analyze_sensitivity, ParamPoint};
-use qd_research::strategies::EmaCrossTrend;
+use qd_research::strategies::{EmaCrossTrend, RsiMeanReversion};
 use qd_research::walkforward::{build_folds, summarize_walkforward, FoldOutcome};
 
 fn main() {
@@ -64,9 +64,27 @@ fn main() {
     let rcfg = RegimeConfig::default();
     let regimes = detect(&bars, &session, &rcfg);
 
-    // Strategy under test: EMA-cross trend.
-    let strat = EmaCrossTrend { fast: cfg.ema_fast, slow: cfg.ema_slow };
-    let signals = strat.signals(&bars.iter().map(|b| b.close).collect::<Vec<_>>(), &regimes);
+    // Strategy under test, from `strategy.name`: EMA-cross trend (rides
+    // trends + breakouts) or RSI mean-reversion (buys dips in chop/range).
+    // Both share the same pipeline below — only the signal source differs.
+    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+    let use_rsi = cfg.strategy_name == "RsiMeanReversion";
+    let signals = if use_rsi {
+        RsiMeanReversion {
+            period: cfg.rsi_period,
+            oversold: cfg.rsi_oversold,
+            overbought: cfg.rsi_overbought,
+            allow_shorts: cfg.rsi_shorts,
+        }
+        .signals(&closes, &regimes)
+    } else {
+        EmaCrossTrend { fast: cfg.ema_fast, slow: cfg.ema_slow }.signals(&closes, &regimes)
+    };
+    let wf_label = if use_rsi {
+        format!("rsi{}/{}-{}", cfg.rsi_period, cfg.rsi_oversold, cfg.rsi_overbought)
+    } else {
+        format!("ema{}/{}", cfg.ema_fast, cfg.ema_slow)
+    };
     let feature_ids = vec![1u64; n];
     let exec = ExecConfig {
         commission: cfg.commission,
@@ -99,7 +117,7 @@ fn main() {
         let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
         outcomes.push(FoldOutcome {
             fold: k,
-            selected_config: format!("ema{}/{}", cfg.ema_fast, cfg.ema_slow),
+            selected_config: wf_label.clone(),
             is_score: 0.0,
             oos_return: m.total_return,
             oos_max_dd: m.max_drawdown,
@@ -130,65 +148,114 @@ fn main() {
     });
     let cpcv_summary = qd_research::montecarlo::summarize(cpcv_scores);
 
-    // PBO over a small honest grid: fast ∈ {10,20,30} × slow ∈ {50,100}.
+    // PBO over a small honest grid. EMA: fast ∈ {10,20,30} × slow ∈ {50,100}.
+    // RSI: period ∈ {7,14,21} × oversold ∈ {25,30,35} (overbought fixed).
+    // Same folds, IS Sharpe vs OOS Sharpe — IS/OOS degradation decides.
     let mut cfgs = Vec::new();
     let mut is_m = Vec::new();
     let mut oos_m = Vec::new();
-    for fast in [10usize, 20, 30] {
-        for slow in [50usize, 100] {
-            if fast >= slow {
-                continue;
-            }
-            cfgs.push(format!("ema{fast}/{slow}"));
-            let mut is_row = Vec::new();
-            let mut oos_row = Vec::new();
-            for f in build_folds(n, cfg.wf_train, cfg.wf_oos, cfg.wf_step, false) {
-                let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-                let sg = EmaCrossTrend { fast, slow }.signals(&closes, &regimes);
-                for (lo, hi) in [(f.is_start, f.is_end), (f.oos_start, f.oos_end)] {
-                    let r = run_backtest(
-                        &bars[lo..hi],
-                        &sg[lo..hi],
-                        &regimes[lo..hi],
-                        &feature_ids[lo..hi],
-                        &exec,
-                        100_000.0,
-                        |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
-                    );
-                    let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
-                    if hi == f.is_end {
-                        is_row.push(m.sharpe);
-                    } else {
-                        oos_row.push(m.sharpe);
-                    }
+    // (label, signal-builder): boxed so the family loop below is shared.
+    let grid: Vec<(String, Box<dyn Fn(&[f64], &[qd_research::regime::Regime]) -> Vec<qd_research::backtest::Signal>>)> =
+        if use_rsi {
+            let mut g: Vec<(String, Box<dyn Fn(&[f64], &[qd_research::regime::Regime]) -> Vec<qd_research::backtest::Signal>>)> = Vec::new();
+            for p in [7usize, 14, 21] {
+                for os in [25.0f64, 30.0, 35.0] {
+                    let ob = cfg.rsi_overbought;
+                    let sh = cfg.rsi_shorts;
+                    g.push((
+                        format!("rsi{p}/{os}-{ob}"),
+                        Box::new(move |c: &[f64], r: &[qd_research::regime::Regime]| {
+                            RsiMeanReversion { period: p, oversold: os, overbought: ob, allow_shorts: sh }.signals(c, r)
+                        }),
+                    ));
                 }
             }
-            is_m.push(is_row);
-            oos_m.push(oos_row);
+            g
+        } else {
+            let mut g: Vec<(String, Box<dyn Fn(&[f64], &[qd_research::regime::Regime]) -> Vec<qd_research::backtest::Signal>>)> = Vec::new();
+            for fast in [10usize, 20, 30] {
+                for slow in [50usize, 100] {
+                    if fast >= slow {
+                        continue;
+                    }
+                    g.push((
+                        format!("ema{fast}/{slow}"),
+                        Box::new(move |c: &[f64], r: &[qd_research::regime::Regime]| {
+                            EmaCrossTrend { fast, slow }.signals(c, r)
+                        }),
+                    ));
+                }
+            }
+            g
+        };
+    for (label, build) in &grid {
+        cfgs.push(label.clone());
+        let mut is_row = Vec::new();
+        let mut oos_row = Vec::new();
+        for f in build_folds(n, cfg.wf_train, cfg.wf_oos, cfg.wf_step, false) {
+            let sg = build(&closes, &regimes);
+            for (lo, hi) in [(f.is_start, f.is_end), (f.oos_start, f.oos_end)] {
+                let r = run_backtest(
+                    &bars[lo..hi],
+                    &sg[lo..hi],
+                    &regimes[lo..hi],
+                    &feature_ids[lo..hi],
+                    &exec,
+                    100_000.0,
+                    |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
+                );
+                let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
+                if hi == f.is_end {
+                    is_row.push(m.sharpe);
+                } else {
+                    oos_row.push(m.sharpe);
+                }
+            }
         }
+        is_m.push(is_row);
+        oos_m.push(oos_row);
     }
     let pbo = analyze_overfitting(
         &ScoreMatrix { configs: cfgs, is: is_m, oos: oos_m },
         &PboBands::default(),
     );
 
-    // Sensitivity around the configured fast EMA (full-sample Sharpe).
-    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
-    let score_of = |fast: usize| {
-        let sg = EmaCrossTrend { fast, slow: cfg.ema_slow }.signals(&closes, &regimes);
+    // Sensitivity around the configured knob (full-sample Sharpe): EMA fast,
+    // or RSI period for the mean-reversion family. Plateau = robust.
+    let (sens_name, sens_base, sens_vals): (&str, f64, Vec<f64>) = if use_rsi {
+        ("rsi_period", cfg.rsi_period as f64, vec![7.0, 10.0, 14.0, 18.0, 21.0])
+    } else {
+        let d: [i64; 4] = [-2, -1, 1, 2];
+        let mut v: Vec<f64> =
+            d.iter().map(|x| (cfg.ema_fast as i64 + x).max(2) as f64).collect();
+        v.push(cfg.ema_fast as f64);
+        ("ema_fast", cfg.ema_fast as f64, v)
+    };
+    let score_of = |val: f64| {
+        let sg = if use_rsi {
+            RsiMeanReversion {
+                period: (val as usize).max(2),
+                oversold: cfg.rsi_oversold,
+                overbought: cfg.rsi_overbought,
+                allow_shorts: cfg.rsi_shorts,
+            }
+            .signals(&closes, &regimes)
+        } else {
+            EmaCrossTrend { fast: (val as usize).max(2), slow: cfg.ema_slow }
+                .signals(&closes, &regimes)
+        };
         let r = run_backtest(&bars, &sg, &regimes, &feature_ids, &exec, 100_000.0, |px, eq| {
             qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
         });
         compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0).sharpe
     };
-    let deltas: [i64; 4] = [-2, -1, 1, 2];
-    let sweep: Vec<ParamPoint> = deltas
+    let sweep: Vec<ParamPoint> = sens_vals
         .iter()
-        .map(|d| (cfg.ema_fast as i64 + d).max(2) as usize)
-        .map(|v| ParamPoint { name: "ema_fast".into(), value: v as f64, score: score_of(v) })
+        .filter(|v| **v != sens_base)
+        .map(|v| ParamPoint { name: sens_name.into(), value: *v, score: score_of(*v) })
         .collect();
     let sens = analyze_sensitivity(
-        ParamPoint { name: "ema_fast".into(), value: cfg.ema_fast as f64, score: score_of(cfg.ema_fast) },
+        ParamPoint { name: sens_name.into(), value: sens_base, score: score_of(sens_base) },
         &sweep,
         0.8,
         0.3,
@@ -243,9 +310,21 @@ fn main() {
             qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
         }, &scfg)
         .expect("shadow candidate runs");
-        // Incumbent: duller slow-EMA on the same unseen window.
-        let inc_sig = EmaCrossTrend { fast: cfg.ema_fast + 10, slow: cfg.ema_slow + 50 }
-            .signals(&closes, &regimes);
+        // Incumbent: a duller sibling of the same family on the same unseen
+        // window — slow EMA for the trend family, slow/long RSI for the
+        // mean-reversion family.
+        let inc_sig = if use_rsi {
+            RsiMeanReversion {
+                period: cfg.rsi_period + 7,
+                oversold: cfg.rsi_oversold - 5.0,
+                overbought: cfg.rsi_overbought,
+                allow_shorts: cfg.rsi_shorts,
+            }
+            .signals(&closes, &regimes)
+        } else {
+            EmaCrossTrend { fast: cfg.ema_fast + 10, slow: cfg.ema_slow + 50 }
+                .signals(&closes, &regimes)
+        };
         let inc = run_shadow(
             &bars[shadow_lo..],
             &inc_sig[shadow_lo..],
@@ -286,12 +365,33 @@ fn main() {
         }
     };
 
+    let (strat_label, strat_cfg) = if use_rsi {
+        (
+            format!(
+                "RsiMeanReversion({},{:.0},{:.0}{})",
+                cfg.rsi_period,
+                cfg.rsi_oversold,
+                cfg.rsi_overbought,
+                if cfg.rsi_shorts { ",shorts" } else { ",long-only" }
+            ),
+            format!(
+                "period={} os={:.0} ob={:.0} shorts={} stop={:.3} take={:.3} risk={:.3}",
+                cfg.rsi_period, cfg.rsi_oversold, cfg.rsi_overbought,
+                cfg.rsi_shorts, cfg.stop_loss, cfg.take_profit, cfg.risk_fraction
+            ),
+        )
+    } else {
+        (
+            format!("EmaCrossTrend({},{})", cfg.ema_fast, cfg.ema_slow),
+            format!(
+                "fast={} slow={} stop={:.3} take={:.3} risk={:.3}",
+                cfg.ema_fast, cfg.ema_slow, cfg.stop_loss, cfg.take_profit, cfg.risk_fraction
+            ),
+        )
+    };
     let input = ResearchInput {
-        strategy_name: format!("EmaCrossTrend({},{})", cfg.ema_fast, cfg.ema_slow),
-        strategy_config: format!(
-            "fast={} slow={} stop={:.3} take={:.3} risk={:.3}",
-            cfg.ema_fast, cfg.ema_slow, cfg.stop_loss, cfg.take_profit, cfg.risk_fraction
-        ),
+        strategy_name: strat_label,
+        strategy_config: strat_cfg,
         asset: cfg.asset.clone(),
         timeframe: cfg.timeframe.clone(),
         date_range: data_label.clone(),

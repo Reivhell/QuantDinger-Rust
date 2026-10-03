@@ -25,6 +25,8 @@ pub struct SensitivityReport {
 
 /// Classify a sweep. `stable_band` (default 0.8): worst point keeps 80% of
 /// baseline. Below `collapse_band` (default 0.3) any single point = spike.
+/// A non-positive baseline is reported as NO_EDGE (no edge to be stable
+/// about), distinct from UNSTABLE (there IS an edge, but it collapses).
 pub fn analyze_sensitivity(
     baseline: ParamPoint,
     sweep: &[ParamPoint],
@@ -36,7 +38,7 @@ pub fn analyze_sensitivity(
             baseline,
             worst_relative: 0.0,
             viable_fraction: 0.0,
-            verdict: "UNSTABLE",
+            verdict: "NO_EDGE",
         };
     }
     let worst = sweep.iter().map(|p| p.score / baseline.score).fold(f64::INFINITY, f64::min);

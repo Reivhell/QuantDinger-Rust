@@ -150,7 +150,10 @@ fn main() {
 
     // PBO over a small honest grid. EMA: fast ∈ {10,20,30} × slow ∈ {50,100}.
     // RSI: period ∈ {7,14,21} × oversold ∈ {25,30,35} (overbought fixed).
-    // Same folds, IS Sharpe vs OOS Sharpe — IS/OOS degradation decides.
+    // Same folds, IS robust-return vs OOS robust-return — IS/OOS degradation
+    // decides. Robust = total return with a trade-count floor: Sharpe on
+    // 0-2 trades is ±infinity garbage (var≈0), so windows with <3 trades
+    // score 0.0 (no evidence) instead of a spurious extreme.
     let mut cfgs = Vec::new();
     let mut is_m = Vec::new();
     let mut oos_m = Vec::new();
@@ -205,10 +208,12 @@ fn main() {
                     |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
                 );
                 let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
+                // Trade-count floor: <3 trades carries no rankable evidence.
+                let robust = if m.num_trades >= 3 { m.total_return } else { 0.0 };
                 if hi == f.is_end {
-                    is_row.push(m.sharpe);
+                    is_row.push(robust);
                 } else {
-                    oos_row.push(m.sharpe);
+                    oos_row.push(robust);
                 }
             }
         }
@@ -220,8 +225,10 @@ fn main() {
         &PboBands::default(),
     );
 
-    // Sensitivity around the configured knob (full-sample Sharpe): EMA fast,
-    // or RSI period for the mean-reversion family. Plateau = robust.
+    // Sensitivity around the configured knob (full-sample robust return —
+    // total return with the same <3-trade floor, so thin windows score 0
+    // instead of Sharpe ±infinity): EMA fast, or RSI period for the
+    // mean-reversion family. Plateau = robust.
     let (sens_name, sens_base, sens_vals): (&str, f64, Vec<f64>) = if use_rsi {
         ("rsi_period", cfg.rsi_period as f64, vec![7.0, 10.0, 14.0, 18.0, 21.0])
     } else {
@@ -247,7 +254,8 @@ fn main() {
         let r = run_backtest(&bars, &sg, &regimes, &feature_ids, &exec, 100_000.0, |px, eq| {
             qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
         });
-        compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0).sharpe
+        let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
+        if m.num_trades >= 3 { m.total_return } else { 0.0 }
     };
     let sweep: Vec<ParamPoint> = sens_vals
         .iter()

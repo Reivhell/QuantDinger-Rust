@@ -11,35 +11,15 @@ use qd_research::autonomy::{
     EntryCtx, EntryVerdict, LoopStage, StrategyVersion, VersionRegistry,
 };
 use qd_research::backtest::{run_backtest, ExecConfig, Signal};
-use qd_research::features::Bar;
-use qd_research::montecarlo::SplitMix64;
+use qd_research::data::synthetic_bars;
 use qd_research::regime::{detect, Regime, RegimeConfig};
 use qd_research::risk::{liquidation_ok, KillSwitch, MAX_LEVERAGE};
-
-fn synth_bars(n: usize, seed: u64) -> Vec<Bar> {
-    let mut rng = SplitMix64(seed);
-    let mut bars = Vec::with_capacity(n);
-    let mut px = 100.0;
-    for i in 0..n {
-        let drift = if i < n / 3 { 0.0012 } else if i < 2 * n / 3 { 0.0 } else { -0.0008 };
-        let vol = if i >= 2 * n / 3 { 0.020 } else { 0.008 };
-        let u1 = rng.next_f64().max(1e-12);
-        let u2 = rng.next_f64();
-        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-        let close = px * (1.0 + drift + vol * z);
-        let high = px.max(close) * (1.0 + vol * rng.next_f64() * 0.3);
-        let low = px.min(close) * (1.0 - vol * rng.next_f64() * 0.3);
-        bars.push(Bar { t: i as i64, open: px, high, low, close, volume: 1000.0 });
-        px = close;
-    }
-    bars
-}
 
 fn main() {
     let cfg = qd_research::config::load_config(qd_research::config::DEFAULT_CONFIG_JSON)
         .expect("built-in default config parses");
     let n = cfg.bars;
-    let bars = synth_bars(n, cfg.data_seed);
+    let bars = synthetic_bars(n, cfg.data_seed);
     let regimes = detect(&bars, &vec![1i64; n], &RegimeConfig::default());
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
     // Strategy proposes: RAW EMA cross with NO regime filter. The strategy

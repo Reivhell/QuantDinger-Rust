@@ -5,7 +5,8 @@
 //! Example (`research.json`):
 //! ```json
 //! {
-//!   "data": {"asset": "SYNTH", "timeframe": "1d", "bars": 1500, "seed": 42},
+//!   "data": {"asset": "BTC-USDT", "timeframe": "1D", "bars": 1500, "seed": 42,
+//!            "csv": "/tmp/btc_usdt_1d.csv"},
 //!   "strategy": {"name": "EmaCrossTrend", "fast": 20, "slow": 50,
 //!                "stop_loss": 0.03, "take_profit": 0.06, "risk_fraction": 0.01},
 //!   "execution": {"commission": 0.0005, "spread": 0.0002, "slippage": 0.0003,
@@ -26,6 +27,10 @@ pub struct ResearchConfig {
     pub timeframe: String,
     pub bars: usize,
     pub data_seed: u64,
+    /// Path to a strict-CSV bar file (`t,open,high,low,close,volume`).
+    /// Empty = deterministic synthetic fixture. Non-empty = REAL market
+    /// data via [`crate::data::load_bars_csv`]; the fixture is never used.
+    pub csv: String,
     // strategy
     pub strategy_name: String,
     pub ema_fast: usize,
@@ -81,6 +86,7 @@ impl Default for ResearchConfig {
             timeframe: "1d".into(),
             bars: 1500,
             data_seed: 42,
+            csv: String::new(),
             strategy_name: "EmaCrossTrend".into(),
             ema_fast: 20,
             ema_slow: 50,
@@ -143,6 +149,7 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
     for (sec, key, slot) in [
         ("data", "asset", &mut cfg.asset),
         ("data", "timeframe", &mut cfg.timeframe),
+        ("data", "csv", &mut cfg.csv),
         ("strategy", "name", &mut cfg.strategy_name),
     ] {
         if let Some(s) = obj(&root, sec).and_then(|o| obj(o, key)) {
@@ -328,6 +335,15 @@ mod tests {
         let c = load_config(r#"{"strategy": {"fast": 10, "slow": 30}}"#).unwrap();
         assert_eq!((c.ema_fast, c.ema_slow), (10, 30));
         assert_eq!(c.bars, 1500); // default kept
+    }
+
+    #[test]
+    fn csv_path_parses_and_defaults_empty() {
+        let c = load_config(DEFAULT_CONFIG_JSON).expect("default parses");
+        assert!(c.csv.is_empty()); // synthetic fixture unless configured
+        let r = load_config(r#"{"data": {"csv": "/tmp/btc_usdt_1d.csv", "bars": 1000}}"#).unwrap();
+        assert_eq!(r.csv, "/tmp/btc_usdt_1d.csv");
+        assert!(load_config(r#"{"data": {"csv": 42}}"#).is_err()); // type errors are loud
     }
 
     #[test]

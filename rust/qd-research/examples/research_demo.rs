@@ -1,59 +1,28 @@
-//! Full research-pipeline demo on seeded synthetic OHLCV.
+//! Full research-pipeline runner on REAL market data (or seeded fixture).
 //!
-//! Generates a deterministic series (trend + range + vol-shock regimes),
-//! runs features → regime → two reference strategies → backtest → metrics →
+//! Data comes from `data.csv` in the research config: a strict-CSV bar file
+//! (`t,open,high,low,close,volume`) produced e.g. by `fetch_okx.sh` from a
+//! public exchange API — no demo feed, no invented candles. Only when
+//! `data.csv` is empty does it fall back to the deterministic synthetic
+//! fixture (seeded, reproducible, labeled SYNTH in the report).
+//! Runs features → regime → two reference strategies → backtest → metrics →
 //! MAE/MFE → walk-forward → Monte Carlo → CPCV → PBO → sensitivity → cost
-//! stress → JSON + Markdown report. Proves the pipeline is wired end to end.
+//! stress → shadow (§12 bulkhead on the unseen last third) → JSON + Markdown
+//! report. Proves the pipeline is wired end to end.
 
 use qd_research::backtest::{run_backtest, ExecConfig};
 use qd_research::costs::{cost_stress, execution_sensitivity};
 use qd_research::cpcv::{cpcv_splits, score_cpcv_paths};
-use qd_research::features::Bar;
+use qd_research::data::{load_bars_csv, synthetic_bars};
 use qd_research::mae_mfe::analyze_mae_mfe;
 use qd_research::metrics::compute_metrics;
-use qd_research::montecarlo::{run_monte_carlo, SplitMix64};
+use qd_research::montecarlo::run_monte_carlo;
 use qd_research::pbo::{analyze_overfitting, PboBands, ScoreMatrix};
 use qd_research::regime::{detect, RegimeConfig};
 use qd_research::report::{regime_slices, report_json, report_markdown, ResearchInput};
 use qd_research::sensitivity::{analyze_sensitivity, ParamPoint};
 use qd_research::strategies::EmaCrossTrend;
 use qd_research::walkforward::{build_folds, summarize_walkforward, FoldOutcome};
-
-fn synth_bars(n: usize, seed: u64) -> Vec<Bar> {
-    // Deterministic GBM-ish path with three phases: trend, range, shock.
-    let mut rng = SplitMix64(seed);
-    let mut bars = Vec::with_capacity(n);
-    let mut px = 100.0;
-    for i in 0..n {
-        let drift = if i < n / 3 {
-            0.0012
-        } else if i < 2 * n / 3 {
-            0.0
-        } else {
-            -0.0008
-        };
-        let vol = if i >= 2 * n / 3 { 0.020 } else { 0.008 };
-        // Box-Muller from the seeded RNG.
-        let u1 = rng.next_f64().max(1e-12);
-        let u2 = rng.next_f64();
-        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-        let ret = drift + vol * z;
-        let open = px;
-        let close = open * (1.0 + ret);
-        let high = open.max(close) * (1.0 + vol * rng.next_f64() * 0.3);
-        let low = open.min(close) * (1.0 - vol * rng.next_f64() * 0.3);
-        bars.push(Bar {
-            t: i as i64,
-            open,
-            high,
-            low,
-            close,
-            volume: 1000.0 + rng.next_f64() * 500.0,
-        });
-        px = close;
-    }
-    bars
-}
 
 fn main() {
     // Config: first CLI arg = path to research.json, else built-in default.
@@ -68,8 +37,29 @@ fn main() {
         qd_research::config::load_config(qd_research::config::DEFAULT_CONFIG_JSON)
             .expect("built-in default config parses")
     };
-    let n = cfg.bars;
-    let bars = synth_bars(n, cfg.data_seed);
+    let n_cfg = cfg.bars;
+    // REAL data first: `data.csv` (public exchange candles via fetch_okx.sh).
+    // Synthetic only when no CSV is configured — and the report says so.
+    let (bars, data_label) = if cfg.csv.trim().is_empty() {
+        (
+            synthetic_bars(n_cfg, cfg.data_seed),
+            format!("synthetic seeded (seed={})", cfg.data_seed),
+        )
+    } else {
+        let text = std::fs::read_to_string(&cfg.csv)
+            .unwrap_or_else(|e| panic!("cannot read data.csv {}: {e}", cfg.csv));
+        let loaded = load_bars_csv(&text)
+            .unwrap_or_else(|e| panic!("invalid CSV {}: {e}", cfg.csv));
+        let label = format!("REAL {} ({} bars, t {}..{})", cfg.csv, loaded.len(), loaded.first().map(|b| b.t).unwrap_or(0), loaded.last().map(|b| b.t).unwrap_or(0));
+        (loaded, label)
+    };
+    let n = bars.len();
+    if n < cfg.wf_train + cfg.wf_oos {
+        panic!(
+            "data has {n} bars, need >= {} for one walk-forward train+oos window",
+            cfg.wf_train + cfg.wf_oos
+        );
+    }
     let session = vec![1i64; n];
     let rcfg = RegimeConfig::default();
     let regimes = detect(&bars, &session, &rcfg);
@@ -208,6 +198,94 @@ fn main() {
     let cs = cost_stress(&gc, &[1.0, 1.25, 1.5, 2.0, 3.0]);
     let cv = execution_sensitivity(&cs).to_string();
 
+    // Shadow bulkhead (§12): the LAST third of bars is unseen by every
+    // earlier stage (WF folds, CPCV runs, PBO grid all score IS/OOS windows
+    // of their own — none trains here). The candidate (configured EMA) runs
+    // under the autonomous gate + live kill-switch against a duller
+    // incumbent (slow EMA); the drawdown-first verdict feeds the
+    // Shadow → Deploy loop transition.
+    let shadow_lo = 2 * n / 3;
+    let shadow = {
+        use qd_research::regime::Regime as RG;
+        use qd_research::shadow::{compare_candidate, run_shadow, ShadowConfig};
+        let scfg = ShadowConfig {
+            starting_equity: 100_000.0,
+            max_positions: cfg.max_positions,
+            max_open_risk: cfg.max_open_risk,
+            blocked_regimes: vec![
+                RG::Ranging,
+                RG::HighVolatility,
+                RG::LowVolatility,
+                RG::MeanReversion,
+                RG::Abnormal,
+            ],
+            leverage_ok: true,
+            stop_present: cfg.stop_loss > 0.0,
+            execution_ok: true,
+            ks_daily: cfg.max_daily_loss,
+            ks_weekly: cfg.max_weekly_loss,
+            ks_drawdown: cfg.max_drawdown,
+            ks_exposure: cfg.max_exposure,
+            ks_corr: cfg.max_correlated_exposure,
+            week_bars: 5,
+            session_bars: 50,
+        };
+        let w = |lo: usize| {
+            (
+                &bars[lo..],
+                &signals[lo..],
+                &regimes[lo..],
+                &feature_ids[lo..],
+            )
+        };
+        let (wb, ws, wr, wf) = w(shadow_lo);
+        let cand = run_shadow(wb, ws, wr, wf, &exec, |px, eq| {
+            qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
+        }, &scfg)
+        .expect("shadow candidate runs");
+        // Incumbent: duller slow-EMA on the same unseen window.
+        let inc_sig = EmaCrossTrend { fast: cfg.ema_fast + 10, slow: cfg.ema_slow + 50 }
+            .signals(&closes, &regimes);
+        let inc = run_shadow(
+            &bars[shadow_lo..],
+            &inc_sig[shadow_lo..],
+            &regimes[shadow_lo..],
+            &feature_ids[shadow_lo..],
+            &exec,
+            |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
+            &scfg,
+        )
+        .expect("shadow incumbent runs");
+        println!(
+            "shadow [unseen last third, {} bars]: candidate {} trades ret {:.2}% dd {:.2}% halt {:?} | incumbent {} trades ret {:.2}% dd {:.2}% halt {:?}",
+            n - shadow_lo,
+            cand.trade_count,
+            cand.total_return * 100.0,
+            cand.max_drawdown * 100.0,
+            cand.halt_reason.as_deref().unwrap_or("none"),
+            inc.trade_count,
+            inc.total_return * 100.0,
+            inc.max_drawdown * 100.0,
+            inc.halt_reason.as_deref().unwrap_or("none"),
+        );
+        let verdict = compare_candidate(&cand, &inc, cpcv_summary.median, 0.05, 0.25);
+        println!("shadow verdict: {:?} — {}", verdict.verdict, verdict.reason);
+        qd_research::shadow::ShadowSummary {
+            unseen_bars: n - shadow_lo,
+            candidate_trades: cand.trade_count,
+            candidate_return: cand.total_return,
+            candidate_max_dd: cand.max_drawdown,
+            candidate_halt: cand.halt_reason.clone(),
+            candidate_suppressed: cand.suppressed,
+            incumbent_trades: inc.trade_count,
+            incumbent_return: inc.total_return,
+            incumbent_max_dd: inc.max_drawdown,
+            incumbent_halt: inc.halt_reason.clone(),
+            verdict: format!("{:?}", verdict.verdict),
+            verdict_reason: verdict.reason.to_string(),
+        }
+    };
+
     let input = ResearchInput {
         strategy_name: format!("EmaCrossTrend({},{})", cfg.ema_fast, cfg.ema_slow),
         strategy_config: format!(
@@ -216,7 +294,7 @@ fn main() {
         ),
         asset: cfg.asset.clone(),
         timeframe: cfg.timeframe.clone(),
-        date_range: format!("synthetic seeded (seed={})", cfg.data_seed),
+        date_range: data_label.clone(),
         n_bars: n,
         regime_perf: regime_slices(&res.trades, 100_000.0),
         walkforward: Some(wf),
@@ -229,7 +307,12 @@ fn main() {
         pbo: Some(pbo),
         sensitivity: vec![sens],
         cost_stress: cs,
-        primary_weakness: "synthetic demo — see regime table".into(),
+        shadow: Some(shadow),
+        primary_weakness: if cfg.csv.trim().is_empty() {
+            "synthetic fixture — see regime table".into()
+        } else {
+            format!("real-data run ({data_label}) — see regime table")
+        },
         regime_dependency: "see regime table".into(),
         metrics,
         mae_mfe: Some(mae),

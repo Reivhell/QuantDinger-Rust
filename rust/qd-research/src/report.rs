@@ -10,6 +10,7 @@ use crate::metrics::Metrics;
 use crate::montecarlo::MonteCarloReport;
 use crate::pbo::PboReport;
 use crate::sensitivity::SensitivityReport;
+use crate::shadow::ShadowSummary;
 use crate::walkforward::WalkForwardReport;
 use std::collections::BTreeMap;
 
@@ -93,6 +94,7 @@ pub struct ResearchInput {
     pub sensitivity: Vec<SensitivityReport>,
     pub cost_stress: Vec<CostStressRow>,
     pub cost_verdict: String,
+    pub shadow: Option<ShadowSummary>,
     pub primary_weakness: String,
     pub regime_dependency: String,
 }
@@ -156,6 +158,19 @@ pub fn report_json(r: &ResearchInput) -> String {
         ));
     }
     o.push_str(&format!("\"cost_verdict\":{},", jestr(&r.cost_verdict)));
+    if let Some(s) = &r.shadow {
+        o.push_str(&format!(
+            "\"shadow\":{{\"unseen_bars\":{},\"candidate\":{{\"trades\":{},\"return\":{:.6},\"max_dd\":{:.6},\"halt\":{},\"suppressed_idle\":{}}},\"incumbent\":{{\"trades\":{},\"return\":{:.6},\"max_dd\":{:.6},\"halt\":{}}},\"verdict\":{},\"reason\":{}}},",
+            s.unseen_bars,
+            s.candidate_trades, s.candidate_return, s.candidate_max_dd,
+            match &s.candidate_halt { Some(h) => jestr(h), None => "null".into() },
+            s.candidate_suppressed,
+            s.incumbent_trades, s.incumbent_return, s.incumbent_max_dd,
+            match &s.incumbent_halt { Some(h) => jestr(h), None => "null".into() },
+            jestr(&s.verdict),
+            jestr(&s.verdict_reason),
+        ));
+    }
     o.push_str(&format!("\"regime_dependency\":{},", jestr(&r.regime_dependency)));
     o.push_str(&format!("\"primary_weakness\":{}", jestr(&r.primary_weakness)));
     o.push('}');
@@ -290,6 +305,18 @@ pub fn report_markdown(r: &ResearchInput) -> String {
             ));
         }
         o.push_str(&format!("\nVerdict: {}\n\n", r.cost_verdict));
+    }
+    if let Some(s) = &r.shadow {
+        o.push_str("## 14b. Shadow / Paper (§12 bulkhead)\n");
+        o.push_str(&format!(
+            "- Unseen window: {} bars | Candidate: {} trades, ret {}, DD {}, halt {}, idle-suppressed {} | Incumbent: {} trades, ret {}, DD {}, halt {}\n- Verdict: {} — {}\n\n",
+            s.unseen_bars,
+            s.candidate_trades, pct(s.candidate_return), pct(s.candidate_max_dd),
+            s.candidate_halt.as_deref().unwrap_or("none"), s.candidate_suppressed,
+            s.incumbent_trades, pct(s.incumbent_return), pct(s.incumbent_max_dd),
+            s.incumbent_halt.as_deref().unwrap_or("none"),
+            s.verdict, s.verdict_reason,
+        ));
     }
     o.push_str("## 15. Robustness Assessment (evidence, not verdicts)\n");
     o.push_str(&format!("- Primary weakness: {}\n", r.primary_weakness));

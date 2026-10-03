@@ -110,6 +110,49 @@ impl KillSwitch {
     pub fn reason(&self) -> Option<&str> {
         self.tripped_reason.as_deref()
     }
+
+    /// Manual risk reset after a halt (new session / operator review).
+    /// Latched trips are never cleared implicitly — this explicit call is
+    /// the "WAIT FOR RISK RESET" path.
+    pub fn reset(&mut self) {
+        self.day_start = f64::NAN;
+        self.peak = f64::NEG_INFINITY;
+        self.tripped_reason = None;
+    }
+}
+
+/// Hard ceiling for configured leverage: anything above is rejected as
+/// excessive regardless of justification (spot = 1.0 is the default).
+pub const MAX_LEVERAGE: f64 = 5.0;
+
+/// Approximate liquidation distance as a fraction of notional for isolated
+/// margin: the adverse move that wipes the position (`1/leverage`).
+/// `None` for spot (`leverage <= 1`): no liquidation exists.
+/// Conservative by design — ignores maintenance margin, so real
+/// liquidation is *closer* than this number.
+pub fn liquidation_distance(leverage: f64) -> Option<f64> {
+    if leverage <= 1.0 {
+        None
+    } else if leverage.is_finite() && leverage > 0.0 {
+        Some(1.0 / leverage)
+    } else {
+        None
+    }
+}
+
+/// Liquidation safety: spot always passes; a margined position passes only
+/// when its liquidation distance covers the stop distance with at least
+/// `min_buffer_multiple` headroom (e.g. 3x: a 3% stop needs ≥9% to
+/// liquidation). Rejects leverage that turns a normal stop-out into a
+/// liquidation-risk trade.
+pub fn liquidation_ok(leverage: f64, stop_loss: f64, min_buffer_multiple: f64) -> bool {
+    if leverage <= 1.0 {
+        return stop_loss > 0.0; // spot: only a protective stop is required
+    }
+    match liquidation_distance(leverage) {
+        Some(d) => stop_loss > 0.0 && d >= stop_loss * min_buffer_multiple,
+        None => false,
+    }
 }
 
 #[cfg(test)]

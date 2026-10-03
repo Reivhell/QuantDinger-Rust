@@ -24,7 +24,9 @@ pub struct ExecConfig {
     /// Fraction of the order filled when the bar's range can't absorb it
     /// (partial fills); remainder chases the next bar. `1.0` = always full.
     pub fill_fraction: f64,
-    /// Stop-loss distance as fraction of entry (0 = disabled).
+    /// Stop-loss distance as fraction of entry. MANDATORY (> 0): every
+    /// position must carry a protective stop (hard 3% cap enforced in
+    /// [`crate::config`]). `0` disables — unit tests only, never research.
     pub stop_loss: f64,
     /// Take-profit distance as fraction of entry (0 = disabled).
     pub take_profit: f64,
@@ -45,7 +47,7 @@ impl Default for ExecConfig {
             slippage: 0.0003,
             latency_bars: 1,
             fill_fraction: 1.0,
-            stop_loss: 0.0,
+            stop_loss: 0.03, // mandatory protective stop (hard cap, see config)
             take_profit: 0.0,
             trailing: 0.0,
             leverage: 1.0,
@@ -386,7 +388,23 @@ fn exit_fill_price(pos: &OpenPosition, bar: &Bar, reason: &str, cfg: &ExecConfig
         "trailing" => pos.trail_level.unwrap_or(bar.close),
         _ => return market_fill_price(bar.open, -pos.direction, cfg),
     };
-    market_fill_price(level, -pos.direction, cfg)
+    // Gap risk: a stop level is not a guaranteed fill. If the bar opened
+    // beyond the level (overnight/weekend gap), the market order fills near
+    // the open — worse for protective stops. Favorable gaps (take-profit)
+    // fill near the open too, which is what a real market order receives.
+    let protective = reason != "take_profit";
+    let base = if bar.open.is_finite() {
+        if pos.direction > 0 {
+            if protective { level.min(bar.open) } else { level.max(bar.open) }
+        } else if protective {
+            level.max(bar.open)
+        } else {
+            level.min(bar.open)
+        }
+    } else {
+        level
+    };
+    market_fill_price(base, -pos.direction, cfg)
 }
 
 fn close_position(

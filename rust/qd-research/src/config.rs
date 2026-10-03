@@ -33,6 +33,25 @@ pub struct ResearchConfig {
     pub stop_loss: f64,
     pub take_profit: f64,
     pub risk_fraction: f64,
+    // hard risk limits (§1/§2/§4): deterministic caps the strategy,
+    // optimizer, LLM context, and agent can never override.
+    /// Hard ceiling on stop-loss distance (default 0.03 = 3%). Any
+    /// configured `stop_loss` above this is rejected, not clamped.
+    pub max_stop_loss: f64,
+    /// Configured leverage (default 1.0 = spot). Rejected above
+    /// [`crate::risk::MAX_LEVERAGE`]; below that, the liquidation buffer
+    /// check ([`crate::risk::liquidation_ok`]) still applies.
+    pub leverage: f64,
+    /// Maximum simultaneous positions (§4).
+    pub max_positions: usize,
+    /// Maximum total open risk as fraction of equity (§4).
+    pub max_open_risk: f64,
+    /// Latch halt if intraday equity falls this fraction (§4).
+    pub max_daily_loss: f64,
+    /// Latch halt if equity falls this fraction below peak (§4).
+    pub max_drawdown: f64,
+    /// Latch halt if exposure notional exceeds this multiple of equity (§4).
+    pub max_exposure: f64,
     // execution
     pub commission: f64,
     pub spread: f64,
@@ -62,11 +81,18 @@ impl Default for ResearchConfig {
             stop_loss: 0.03,
             take_profit: 0.06,
             risk_fraction: 0.01,
+            max_stop_loss: 0.03,
+            leverage: 1.0,
+            max_positions: 3,
+            max_open_risk: 0.06,
+            max_daily_loss: 0.02,
+            max_drawdown: 0.10,
+            max_exposure: 3.0,
             commission: 0.0005,
             spread: 0.0002,
             slippage: 0.0003,
             latency_bars: 1,
-            mc_sims: 2000,
+            mc_sims: 10_000,
             mc_seed: 42,
             cpcv_partitions: 6,
             cpcv_test: 2,
@@ -151,6 +177,27 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
     if let Some(v) = want_num("strategy", "risk_fraction") {
         cfg.risk_fraction = v;
     }
+    if let Some(v) = want_num("strategy", "max_stop_loss") {
+        cfg.max_stop_loss = v;
+    }
+    if let Some(v) = want_num("strategy", "leverage") {
+        cfg.leverage = v;
+    }
+    if let Some(v) = want_num("strategy", "max_positions") {
+        cfg.max_positions = v as usize;
+    }
+    if let Some(v) = want_num("strategy", "max_open_risk") {
+        cfg.max_open_risk = v;
+    }
+    if let Some(v) = want_num("strategy", "max_daily_loss") {
+        cfg.max_daily_loss = v;
+    }
+    if let Some(v) = want_num("strategy", "max_drawdown") {
+        cfg.max_drawdown = v;
+    }
+    if let Some(v) = want_num("strategy", "max_exposure") {
+        cfg.max_exposure = v;
+    }
     if let Some(v) = want_num("execution", "commission") {
         cfg.commission = v;
     }
@@ -203,6 +250,32 @@ pub fn load_config(json: &str) -> Result<ResearchConfig, String> {
     if cfg.cpcv_test == 0 || cfg.cpcv_test >= cfg.cpcv_partitions.max(2) {
         return Err("config: need 1 <= robustness.cpcv_test < cpcv_partitions".into());
     }
+    // Hard risk guards (§1/§2/§4): reject, never clamp. The strategy,
+    // optimizer, LLM context, and agent cannot override these.
+    if cfg.stop_loss <= 0.0 {
+        return Err("config: strategy.stop_loss must be > 0 (mandatory protective stop)".into());
+    }
+    if cfg.max_stop_loss <= 0.0 || cfg.stop_loss > cfg.max_stop_loss {
+        return Err("config: strategy.stop_loss exceeds strategy.max_stop_loss (3% cap)".into());
+    }
+    if cfg.leverage < 1.0 || cfg.leverage > crate::risk::MAX_LEVERAGE {
+        return Err(format!(
+            "config: strategy.leverage must be in [1.0, {}] (spot default)",
+            crate::risk::MAX_LEVERAGE
+        ));
+    }
+    if !crate::risk::liquidation_ok(cfg.leverage, cfg.stop_loss, 3.0) {
+        return Err("config: liquidation buffer < 3x stop distance (leverage unsafe)".into());
+    }
+    if cfg.risk_fraction <= 0.0 || cfg.risk_fraction > 0.05 {
+        return Err("config: strategy.risk_fraction must be in (0, 0.05]".into());
+    }
+    if cfg.max_positions == 0 {
+        return Err("config: strategy.max_positions must be >= 1".into());
+    }
+    if cfg.max_open_risk <= 0.0 || cfg.max_drawdown <= 0.0 || cfg.max_daily_loss <= 0.0 {
+        return Err("config: max_open_risk/max_drawdown/max_daily_loss must all be > 0".into());
+    }
     Ok(cfg)
 }
 
@@ -214,7 +287,7 @@ pub const DEFAULT_CONFIG_JSON: &str = r#"{
                "stop_loss": 0.03, "take_profit": 0.06, "risk_fraction": 0.01},
   "execution": {"commission": 0.0005, "spread": 0.0002, "slippage": 0.0003,
                 "latency_bars": 1},
-  "robustness": {"mc_sims": 2000, "seed": 42, "cpcv_partitions": 6,
+  "robustness": {"mc_sims": 10000, "seed": 42, "cpcv_partitions": 6,
                  "cpcv_test": 2, "wf_train": 600, "wf_oos": 150,
                  "wf_step": 150, "min_oos_fraction": 0.5}
 }"#;
@@ -246,5 +319,22 @@ mod tests {
         assert!(load_config(r#"{"strategy": {"fast": 50, "slow": 20}}"#).is_err());
         assert!(load_config(r#"[1,2]"#).is_err());
         assert!(load_config(r#"{"data": {"bars": 10}}"#).is_err()); // too small for WF
+    }
+
+    #[test]
+    fn hard_risk_guards_reject_never_clamp() {
+        // Stop above the 3% cap: rejected outright.
+        assert!(load_config(r#"{"strategy": {"stop_loss": 0.05}}"#).is_err());
+        // No protective stop: rejected.
+        assert!(load_config(r#"{"strategy": {"stop_loss": 0.0}}"#).is_err());
+        // Excessive leverage: rejected.
+        assert!(load_config(r#"{"strategy": {"leverage": 20.0}}"#).is_err());
+        // Leverage whose liquidation buffer (< 3x stop) is unsafe: rejected.
+        // 5x → distance 0.20 vs 3x stop 0.09: passes; 0.20/0.03 = 6.7x ok.
+        assert!(load_config(r#"{"strategy": {"leverage": 5.0}}"#).is_ok());
+        // Oversized per-trade risk: rejected.
+        assert!(load_config(r#"{"strategy": {"risk_fraction": 0.25}}"#).is_err());
+        // Zero position cap: rejected.
+        assert!(load_config(r#"{"strategy": {"max_positions": 0}}"#).is_err());
     }
 }

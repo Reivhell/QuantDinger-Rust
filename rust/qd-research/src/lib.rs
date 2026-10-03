@@ -19,6 +19,7 @@
 //!   NOT IMPLEMENTED with reasons, never faked ([`report`]).
 
 pub mod backtest;
+pub mod autonomy;
 pub mod config;
 pub mod costs;
 pub mod cpcv;

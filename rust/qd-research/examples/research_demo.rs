@@ -166,9 +166,10 @@ fn main() {
     // RSI: period ∈ {7,14,21} × oversold ∈ {25,30,35} (overbought fixed).
     // Donchian: lookback ∈ {10,20,30} × relvol ∈ {1.5,2.0}.
     // Same folds, IS robust-return vs OOS robust-return — IS/OOS degradation
-    // decides. Robust = total return with a trade-count floor: Sharpe on
-    // 0-2 trades is ±infinity garbage (var≈0), so windows with <3 trades
-    // score 0.0 (no evidence) instead of a spurious extreme.
+    // decides. Robust = CAGR with a zero-trade floor: Sharpe on 0-2 trades
+    // was ±infinity garbage (var≈0), which is why a floor exists at all;
+    // CAGR has no such singularity, so only genuinely flat windows (0
+    // trades) score 0.0. 1-2 trade windows keep their real CAGR.
     let mut cfgs = Vec::new();
     let mut is_m = Vec::new();
     let mut oos_m = Vec::new();
@@ -236,13 +237,19 @@ fn main() {
                     |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
                 );
                 let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
-                // Trade-count floor: <3 trades carries no rankable evidence.
+                // Trade-count floor: 0 trades = flat window, no evidence → 0.0.
+                // 1-2 trades are noisy but REAL — zeroing them fabricates flat
+                // windows and drags short-window medians to exactly 0.0 (which
+                // is what pinned degradation at 1.0: most 150-bar OOS windows
+                // hold ~2 Donchian trades). CAGR cannot go ±infinite the way
+                // Sharpe did (no near-zero variance division), so no wider
+                // floor is needed.
                 // CAGR, not total return: IS windows (600 bars) are 4x the
                 // OOS windows (150 bars), so raw totals are length-biased —
                 // a perfectly stable edge shows ~75% "degradation" on totals
                 // alone. CAGR annualizes (252 bars/yr, daily data) and makes
-                // IS/OOS levels comparable. Same <3-trade floor → 0.0.
-                let robust = if m.num_trades >= 3 { m.cagr } else { 0.0 };
+                // IS/OOS levels comparable. 0-trade windows → 0.0.
+                let robust = if m.num_trades == 0 { 0.0 } else { m.cagr };
                 if hi == f.is_end {
                     is_row.push(robust);
                 } else {
@@ -285,7 +292,8 @@ fn main() {
             let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
             // CAGR, not total return: CPCV runs vary in length, so raw
             // totals are length-biased the same way IS/OOS windows were.
-            row.push(if m.num_trades >= 3 { m.cagr } else { 0.0 });
+            // 0-trade runs → 0.0; 1-2 trades are real, keep their CAGR.
+            row.push(if m.num_trades == 0 { 0.0 } else { m.cagr });
         }
         snoop_m.push(row);
     }
@@ -344,7 +352,10 @@ fn main() {
             qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
         });
         let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
-        if m.num_trades >= 3 { m.total_return } else { 0.0 }
+        // Full-sample window is identical for every knob value, so total
+        // return and CAGR rank identically — use CAGR for consistency with
+        // the PBO/snooping grids. 0 trades → 0.0 (flat, no evidence).
+        if m.num_trades == 0 { 0.0 } else { m.cagr }
     };
     let sweep: Vec<ParamPoint> = sens_vals
         .iter()

@@ -56,26 +56,47 @@ fn synth_bars(n: usize, seed: u64) -> Vec<Bar> {
 }
 
 fn main() {
-    let n = 1500;
-    let bars = synth_bars(n, 42);
+    // Config: first CLI arg = path to research.json, else built-in default.
+    // Every tuning constant below comes from `cfg` — nothing is hardcoded.
+    let args: Vec<String> = std::env::args().collect();
+    let cfg = if args.len() > 1 {
+        let text = std::fs::read_to_string(&args[1])
+            .unwrap_or_else(|e| panic!("cannot read config {}: {e}", args[1]));
+        qd_research::config::load_config(&text)
+            .unwrap_or_else(|e| panic!("invalid config {}: {e}", args[1]))
+    } else {
+        qd_research::config::load_config(qd_research::config::DEFAULT_CONFIG_JSON)
+            .expect("built-in default config parses")
+    };
+    let n = cfg.bars;
+    let bars = synth_bars(n, cfg.data_seed);
     let session = vec![1i64; n];
     let rcfg = RegimeConfig::default();
     let regimes = detect(&bars, &session, &rcfg);
 
     // Strategy under test: EMA-cross trend.
-    let strat = EmaCrossTrend { fast: 20, slow: 50 };
+    let strat = EmaCrossTrend { fast: cfg.ema_fast, slow: cfg.ema_slow };
     let signals = strat.signals(&bars.iter().map(|b| b.close).collect::<Vec<_>>(), &regimes);
     let feature_ids = vec![1u64; n];
-    let exec = ExecConfig { stop_loss: 0.03, take_profit: 0.06, ..ExecConfig::default() };
+    let exec = ExecConfig {
+        commission: cfg.commission,
+        spread: cfg.spread,
+        slippage: cfg.slippage,
+        latency_bars: cfg.latency_bars,
+        stop_loss: cfg.stop_loss,
+        take_profit: cfg.take_profit,
+        ..ExecConfig::default()
+    };
+    let (risk, stop) = (cfg.risk_fraction, cfg.stop_loss);
     let res = run_backtest(&bars, &signals, &regimes, &feature_ids, &exec, 100_000.0, |px, eq| {
-        qd_research::risk::fixed_fractional_qty(px, eq, 0.01, 0.03, 20_000.0)
+        qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
     });
     let metrics = compute_metrics(&res.trades, &res.equity_curve, 100_000.0, 252.0);
     let mae = analyze_mae_mfe(&res.trades);
     let rets: Vec<f64> = res.trades.iter().map(|t| t.net_pnl / 100_000.0).collect();
 
-    // Walk-forward: 600-bar IS, 150-bar OOS, single config (selection trivial).
-    let folds = build_folds(n, 600, 150, 150, false);
+    // Walk-forward: IS window → (trivial selection) → OOS scoring.
+    let folds = build_folds(n, cfg.wf_train, cfg.wf_oos, cfg.wf_step, false);
     let mut outcomes = Vec::new();
     for (k, f) in folds.iter().enumerate() {
         let sub = &bars[f.oos_start..f.oos_end];
@@ -83,12 +104,12 @@ fn main() {
         let sub_reg = &regimes[f.oos_start..f.oos_end];
         let sub_fid = &feature_ids[f.oos_start..f.oos_end];
         let r = run_backtest(sub, sub_sig, sub_reg, sub_fid, &exec, 100_000.0, |px, eq| {
-            qd_research::risk::fixed_fractional_qty(px, eq, 0.01, 0.03, 20_000.0)
+            qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
         });
         let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
         outcomes.push(FoldOutcome {
             fold: k,
-            selected_config: "ema20/50".into(),
+            selected_config: format!("ema{}/{}", cfg.ema_fast, cfg.ema_slow),
             is_score: 0.0,
             oos_return: m.total_return,
             oos_max_dd: m.max_drawdown,
@@ -97,14 +118,14 @@ fn main() {
             oos_trades: m.num_trades,
         });
     }
-    let wf = summarize_walkforward(outcomes, 0.5);
+    let wf = summarize_walkforward(outcomes, cfg.min_oos_fraction);
 
-    let mc = run_monte_carlo(&rets, 2000, 42);
+    let mc = run_monte_carlo(&rets, cfg.mc_sims, cfg.mc_seed);
     // CPCV: 15 paths over the full series; each contiguous test run is
     // scored flat-to-flat with the strategy under test. Slicing precomputed
     // signals/regimes is leak-free: every feature is causal per bar, and
     // each run starts with no position.
-    let splits = cpcv_splits(n, 6, 2, 5, 2);
+    let splits = cpcv_splits(n, cfg.cpcv_partitions, cfg.cpcv_test, 5, 2);
     let cpcv_scores = score_cpcv_paths(&splits, 50, |lo, hi| {
         let r = run_backtest(
             &bars[lo..hi],
@@ -113,7 +134,7 @@ fn main() {
             &feature_ids[lo..hi],
             &exec,
             100_000.0,
-            |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, 0.01, 0.03, 20_000.0),
+            |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
         );
         compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0).total_return
     });
@@ -131,7 +152,7 @@ fn main() {
             cfgs.push(format!("ema{fast}/{slow}"));
             let mut is_row = Vec::new();
             let mut oos_row = Vec::new();
-            for f in build_folds(n, 600, 150, 300, false) {
+            for f in build_folds(n, cfg.wf_train, cfg.wf_oos, cfg.wf_step, false) {
                 let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
                 let sg = EmaCrossTrend { fast, slow }.signals(&closes, &regimes);
                 for (lo, hi) in [(f.is_start, f.is_end), (f.oos_start, f.oos_end)] {
@@ -142,7 +163,7 @@ fn main() {
                         &feature_ids[lo..hi],
                         &exec,
                         100_000.0,
-                        |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, 0.01, 0.03, 20_000.0),
+                        |px, eq| qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0),
                     );
                     let m = compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0);
                     if hi == f.is_end {
@@ -161,22 +182,23 @@ fn main() {
         &PboBands::default(),
     );
 
-    // Sensitivity around fast=20 (OOS Sharpe as score, recomputed per value).
+    // Sensitivity around the configured fast EMA (full-sample Sharpe).
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
     let score_of = |fast: usize| {
-        let sg = EmaCrossTrend { fast, slow: 50 }.signals(&closes, &regimes);
+        let sg = EmaCrossTrend { fast, slow: cfg.ema_slow }.signals(&closes, &regimes);
         let r = run_backtest(&bars, &sg, &regimes, &feature_ids, &exec, 100_000.0, |px, eq| {
-            qd_research::risk::fixed_fractional_qty(px, eq, 0.01, 0.03, 20_000.0)
+            qd_research::risk::fixed_fractional_qty(px, eq, risk, stop, 20_000.0)
         });
         compute_metrics(&r.trades, &r.equity_curve, 100_000.0, 252.0).sharpe
     };
-    let base_score = score_of(20);
-    let sweep: Vec<ParamPoint> = [18, 19, 21, 22]
+    let deltas: [i64; 4] = [-2, -1, 1, 2];
+    let sweep: Vec<ParamPoint> = deltas
         .iter()
-        .map(|v| ParamPoint { name: "ema_fast".into(), value: *v as f64, score: score_of(*v) })
+        .map(|d| (cfg.ema_fast as i64 + d).max(2) as usize)
+        .map(|v| ParamPoint { name: "ema_fast".into(), value: v as f64, score: score_of(v) })
         .collect();
     let sens = analyze_sensitivity(
-        ParamPoint { name: "ema_fast".into(), value: 20.0, score: base_score },
+        ParamPoint { name: "ema_fast".into(), value: cfg.ema_fast as f64, score: score_of(cfg.ema_fast) },
         &sweep,
         0.8,
         0.3,
@@ -187,11 +209,14 @@ fn main() {
     let cv = execution_sensitivity(&cs).to_string();
 
     let input = ResearchInput {
-        strategy_name: "EmaCrossTrend(20,50)".into(),
-        strategy_config: "fast=20 slow=50 stop=3% take=6% risk=1%".into(),
-        asset: "SYNTH".into(),
-        timeframe: "1d".into(),
-        date_range: "synthetic seeded (seed=42)".into(),
+        strategy_name: format!("EmaCrossTrend({},{})", cfg.ema_fast, cfg.ema_slow),
+        strategy_config: format!(
+            "fast={} slow={} stop={:.3} take={:.3} risk={:.3}",
+            cfg.ema_fast, cfg.ema_slow, cfg.stop_loss, cfg.take_profit, cfg.risk_fraction
+        ),
+        asset: cfg.asset.clone(),
+        timeframe: cfg.timeframe.clone(),
+        date_range: format!("synthetic seeded (seed={})", cfg.data_seed),
         n_bars: n,
         regime_perf: regime_slices(&res.trades, 100_000.0),
         walkforward: Some(wf),

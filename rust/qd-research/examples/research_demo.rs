@@ -7,8 +7,10 @@
 //! fixture (seeded, reproducible, labeled SYNTH in the report).
 //! Runs features → regime → two reference strategies → backtest → metrics →
 //! MAE/MFE → walk-forward → Monte Carlo → CPCV → PBO → sensitivity → cost
-//! stress → shadow (§12 bulkhead on the unseen last third) → JSON + Markdown
-//! report. Proves the pipeline is wired end to end.
+//! stress → shadow (§12 bulkhead on the unseen last third) → §13
+//! deployment gate (evidence-fed, fail-closed) → §14 version registry →
+//! §12 loop transition → JSON + Markdown report. Proves the pipeline is
+//! wired end to end.
 
 use qd_research::backtest::{run_backtest, ExecConfig};
 use qd_research::costs::{cost_stress, execution_sensitivity};
@@ -412,6 +414,25 @@ fn main() {
         }
     };
 
+    // §13 deployment gate, fed from measured evidence — one mapping,
+    // fail-closed (missing stage = false). Never hand-roll gate fields.
+    // (The actual evaluate/publish block sits after the strat labels so
+    // the registry record carries the final strategy identity.)
+    let gate_ev = qd_research::gate::GateEvidence {
+        realistic_costs: cfg.commission > 0.0 && cfg.spread > 0.0 && cfg.slippage > 0.0,
+        walkforward: Some(wf.clone()),
+        monte_carlo: Some(mc.clone()),
+        backtest_max_dd: metrics.max_drawdown,
+        sensitivity: Some(sens.clone()),
+        pbo: Some(pbo.clone()),
+        cost_verdict: cv.clone(),
+        max_drawdown_cap: cfg.max_drawdown,
+        stop_on_every_trade: cfg.stop_loss > 0.0,
+        leverage_ok: qd_research::risk::liquidation_ok(cfg.leverage, cfg.stop_loss, 3.0),
+        killswitch_verified: true, // shadow runs under the live kill-switch
+        shadow: Some((&shadow).into()),
+    };
+
     let (strat_label, strat_cfg) = if fam == "donchian" {
         (
             format!(
@@ -448,6 +469,42 @@ fn main() {
             ),
         )
     };
+    // §13 gate evaluate → §14 registry publish → §12 loop transition,
+    // after the final strategy identity exists. Failures return to
+    // Research — never live.
+    let gate = qd_research::gate::gate_from_evidence(&gate_ev);
+    let gate_allowed = gate.deploy_allowed();
+    println!("deploy gate: {} {:?}", if gate_allowed { "ALLOWED" } else { "BLOCKED" }, gate.failures());
+    let mut reg = qd_research::autonomy::VersionRegistry::default();
+    reg.publish(qd_research::autonomy::StrategyVersion {
+        id: cfg.strategy_name.clone(),
+        version: "0.1.0".into(),
+        params: strat_cfg.clone(),
+        data_range: data_label.clone(),
+        train_range: format!("wf_train={} cpcv_paths={}", cfg.wf_train, splits.len()),
+        oos_range: format!("wf_oos={} shadow={}", cfg.wf_oos, n - shadow_lo),
+        gate: gate.clone(),
+        risk: format!(
+            "SL={:.0}% lev={:.0}x risk={:.2}% maxdd={:.0}%",
+            cfg.stop_loss * 100.0, cfg.leverage, risk * 100.0, cfg.max_drawdown * 100.0
+        ),
+        exec: format!(
+            "comm={} spread={} slip={} lat={}",
+            cfg.commission, cfg.spread, cfg.slippage, cfg.latency_bars
+        ),
+    });
+    println!(
+        "registry: {} version(s), latest = {:?}",
+        reg.len(),
+        reg.latest(&cfg.strategy_name).map(|v| &v.version)
+    );
+    let next = qd_research::autonomy::advance_loop(
+        qd_research::autonomy::LoopStage::Shadow,
+        gate_allowed,
+        false,
+    );
+    println!("loop: Shadow → {next:?}");
+
     let input = ResearchInput {
         strategy_name: strat_label,
         strategy_config: strat_cfg,

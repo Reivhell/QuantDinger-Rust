@@ -7,10 +7,11 @@
 //! pass. No-trade outcomes are reported as idle evidence, never errors.
 
 use qd_research::autonomy::{
-    advance_loop, assess_entry, gate_signals, monitor_position, DeploymentGate, EmergencyState,
+    advance_loop, assess_entry, gate_signals, monitor_position, EmergencyState,
     EntryCtx, EntryVerdict, LoopStage, StrategyVersion, VersionRegistry,
 };
 use qd_research::backtest::{run_backtest, ExecConfig, Signal};
+use qd_research::costs::{cost_stress, execution_sensitivity};
 use qd_research::data::synthetic_bars;
 use qd_research::regime::{detect, Regime, RegimeConfig};
 use qd_research::risk::{liquidation_ok, KillSwitch, MAX_LEVERAGE};
@@ -165,23 +166,31 @@ fn main() {
     println!("emergency: {}", em_reason.as_deref().unwrap_or("healthy"));
     println!("monitor: {holds} hold / {tightens} tighten / {reduces} reduce / {exits} exit");
 
-    // §13 deployment gate from measured evidence (not assertions).
+    // §13 deployment gate via the shared evidence mapping (fail-closed).
+    // Honest scope: this demo exercises the safety stack (gate, monitor,
+    // kill-switch, emergency) — NOT the validation stages (WF, MC, PBO,
+    // sensitivity, shadow live in research_demo). Missing stages feed None
+    // and fail closed, so the expected verdict here is BLOCKED: proof the
+    // gate refuses to bless an unvalidated run.
+    let m_auto = qd_research::metrics::compute_metrics(&auto.trades, &auto.equity_curve, 100_000.0, 252.0);
+    let gc: Vec<(f64, f64)> =
+        auto.trades.iter().map(|t| (t.gross_pnl, t.fees + t.slippage_cost)).collect();
+    let cs = cost_stress(&gc, &[1.0, 1.25, 1.5, 2.0, 3.0]);
     let dd_ok = auto.trades.iter().all(|t| t.mae <= cfg.stop_loss * 2.0);
-    let gate13 = DeploymentGate {
-        no_lookahead: true, // latency>=1 enforced by backtest
-        no_leakage: true,    // causal features, purged splitters
+    let gate13 = qd_research::gate::gate_from_evidence(&qd_research::gate::GateEvidence {
         realistic_costs: cfg.commission > 0.0 && cfg.slippage > 0.0,
-        oos_validated: true, // WF + CPCV stages ran in research_demo
-        walkforward_stable: true,
-        monte_carlo_ok: true,
-        sensitivity_ok: true,
-        drawdown_ok: ks_trip.is_none(),
-        execution_stress_ok: true,
-        risk_limits_ok: true,
-        stop_verified: cfg.stop_loss > 0.0 && dd_ok,
+        walkforward: None, // not run in this demo → fails closed
+        monte_carlo: None, // not run in this demo → fails closed
+        backtest_max_dd: m_auto.max_drawdown,
+        sensitivity: None, // not run in this demo → fails closed
+        pbo: None,         // not run in this demo → fails closed
+        cost_verdict: execution_sensitivity(&cs).to_string(),
+        max_drawdown_cap: cfg.max_drawdown,
+        stop_on_every_trade: cfg.stop_loss > 0.0 && dd_ok,
         leverage_ok: lev_ok,
-        killswitch_verified: true,
-    };
+        killswitch_verified: true, // KS watched the full equity curve above
+        shadow: None, // no holdout in this demo → fails closed
+    });
     println!(
         "deploy: {} {:?}",
         if gate13.deploy_allowed() { "ALLOWED" } else { "BLOCKED" },

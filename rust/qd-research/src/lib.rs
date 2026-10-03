@@ -25,6 +25,7 @@ pub mod costs;
 pub mod cpcv;
 pub mod data;
 pub mod features;
+pub mod gate;
 pub mod mae_mfe;
 pub mod metrics;
 pub mod montecarlo;
